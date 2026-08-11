@@ -109,6 +109,21 @@ h3 {
   gap: 7px;
 }
 
+.inline-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.inline-form button {
+  padding: 0 12px;
+  border-color: rgba(255, 255, 255, 0.18);
+  background: #2e7d5b;
+  color: #ffffff;
+  font-weight: 760;
+  cursor: pointer;
+}
+
 label,
 .metric span,
 .detail span,

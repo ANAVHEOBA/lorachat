@@ -3,6 +3,9 @@ const nodesEl = document.getElementById('nodes');
 const nodeCountEl = document.getElementById('nodeCount');
 const statusEl = document.getElementById('status');
 const nameEl = document.getElementById('name');
+const nodeFormEl = document.getElementById('nodeForm');
+const nodeNameEl = document.getElementById('nodeName');
+const saveNodeEl = document.getElementById('saveNode');
 const messageEl = document.getElementById('message');
 const sendEl = document.getElementById('send');
 const linkPillEl = document.getElementById('linkPill');
@@ -27,6 +30,7 @@ const fields = {
 };
 let lastMessageRender = '';
 let lastNodeRender = '';
+let localNodeName = '';
 
 nameEl.value = localStorage.getItem('loraChatName') || 'User';
 
@@ -115,7 +119,12 @@ function renderStatus(status) {
   const rssi = Number(status.rssi) || 0;
   const snr = Number(status.snr) || 0;
 
-  setText(fields.node, status.node);
+  if (status.name) {
+    localNodeName = status.name;
+    if (!nodeNameEl.value || document.activeElement !== nodeNameEl) nodeNameEl.value = status.name;
+  }
+
+  setText(fields.node, status.name ? `${status.name} | ${status.node}` : status.node);
   setText(fields.dest, status.destination);
   setText(fields.mode, status.mode);
   setText(fields.crypto, status.crypto);
@@ -139,7 +148,7 @@ function renderStatus(status) {
     ? 'Broadcast mesh'
     : `Direct to ${status.destination}`;
   statusEl.classList.remove('offline');
-  statusEl.textContent = `${status.node} to ${status.destination} | ${status.radio}`;
+  statusEl.textContent = `${status.name || status.node} to ${status.destination} | ${status.radio}`;
   linkPillEl.classList.remove('online', 'offline');
   if (hasPacket) linkPillEl.classList.add('online');
 }
@@ -215,6 +224,42 @@ async function refresh() {
   }
 }
 
+async function loadConfig() {
+  try {
+    const res = await fetch('/api/config', { cache: 'no-store' });
+    const config = await res.json();
+    localNodeName = config.name || '';
+    nodeNameEl.value = localNodeName;
+  } catch (err) {
+    statusEl.textContent = 'config unavailable';
+  }
+}
+
+async function saveNodeName(event) {
+  event.preventDefault();
+  const name = nodeNameEl.value.trim();
+  if (!name) return;
+
+  saveNodeEl.disabled = true;
+  try {
+    const body = new URLSearchParams({ name });
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const saved = await res.json();
+    localNodeName = saved.name || name;
+    nodeNameEl.value = localNodeName;
+    await refresh();
+  } catch (err) {
+    statusEl.textContent = 'name save rejected';
+  } finally {
+    saveNodeEl.disabled = false;
+  }
+}
+
 async function sendMessage() {
   const sender = nameEl.value.trim() || 'User';
   const text = messageEl.value.trim();
@@ -243,9 +288,11 @@ async function sendMessage() {
 tabs.forEach(tab => {
   tab.addEventListener('click', () => switchTab(tab.dataset.tab));
 });
+nodeFormEl.addEventListener('submit', saveNodeName);
 sendEl.addEventListener('click', sendMessage);
 messageEl.addEventListener('keydown', event => {
   if (event.key === 'Enter') sendMessage();
 });
 setInterval(refresh, 1000);
+loadConfig();
 refresh();

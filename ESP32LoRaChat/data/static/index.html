@@ -20,9 +20,17 @@
       </div>
 
       <div class="identity">
-        <label for="name">Name</label>
+        <label for="name">Chat Name</label>
         <input id="name" maxlength="18" autocomplete="nickname" placeholder="Name">
       </div>
+
+      <form class="identity" id="nodeForm">
+        <label for="nodeName">Node Name</label>
+        <div class="inline-form">
+          <input id="nodeName" maxlength="24" autocomplete="off" placeholder="Node name">
+          <button id="saveNode" type="submit">Save</button>
+        </div>
+      </form>
 
       <nav class="tabs" aria-label="Main views">
         <button class="tab active" type="button" data-tab="chat">Chat</button>

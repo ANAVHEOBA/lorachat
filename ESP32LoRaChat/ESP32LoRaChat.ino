@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <SPIFFS.h>
+#include <Preferences.h>
 #include <esp_system.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
@@ -112,6 +113,8 @@ const uint8_t RELAY_QUEUE_SIZE = 4;
 const uint8_t HISTORY_SIZE = 60;
 const uint8_t SEEN_CACHE_SIZE = 16;
 const uint8_t MESH_NODE_COUNT = 3;
+const size_t MAX_NODE_NAME_LEN = 24;
+const size_t MAX_ROLE_LEN = 16;
 const size_t MAX_SENDER_LEN = 18;
 const size_t MAX_MESSAGE_LEN = 120;
 const size_t MAX_PLAINTEXT_LEN = MAX_SENDER_LEN + 1 + MAX_MESSAGE_LEN;
@@ -119,6 +122,7 @@ const size_t MAX_FRAME_LEN = CRYPTO_NONCE_SIZE + MAX_PLAINTEXT_LEN + CRYPTO_TAG_
 const size_t MAX_RADIO_PACKET_LEN = PACKET_HEADER_SIZE + MAX_FRAME_LEN;
 
 WebServer server(80);
+Preferences prefs;
 bool staticFsReady = false;
 
 struct ChatEntry {
@@ -174,8 +178,8 @@ struct PendingRelay {
 
 struct MeshNodeInfo {
   uint8_t address = 0;
-  const char *name = "";
-  const char *role = "";
+  char name[MAX_NODE_NAME_LEN + 1] = "";
+  char role[MAX_ROLE_LEN + 1] = "";
   bool local = false;
   bool heard = false;
   uint32_t rxCount = 0;
@@ -190,7 +194,20 @@ struct MeshNodeInfo {
   MeshNodeInfo() {}
 
   MeshNodeInfo(uint8_t addressIn, const char *nameIn, const char *roleIn, bool localIn)
-      : address(addressIn), name(nameIn), role(roleIn), local(localIn) {}
+      : address(addressIn), local(localIn) {
+    setName(nameIn);
+    setRole(roleIn);
+  }
+
+  void setName(const char *value) {
+    if (value == nullptr || value[0] == '\0') value = "Node";
+    strlcpy(name, value, sizeof(name));
+  }
+
+  void setRole(const char *value) {
+    if (value == nullptr || value[0] == '\0') value = "node";
+    strlcpy(role, value, sizeof(role));
+  }
 };
 
 ChatEntry history[HISTORY_SIZE];
@@ -271,8 +288,11 @@ String destinationLabel();
 String radioBackendLabel();
 String radioConfigLabel();
 bool radioSignalAvailable();
+String defaultLocalNodeName();
 String jsonEscape(const String &value);
 String cleanField(String value, size_t maxLen);
+void loadNodeConfig();
+bool saveLocalNodeName(const String &name);
 String contentTypeForPath(const String &path);
 void sendNoStoreJson(int code, const String &payload);
 bool serveStaticFile(String path);
@@ -281,6 +301,8 @@ void handleSend();
 void handleMessages();
 void handleStatus();
 void handleNodes();
+void handleConfigGet();
+void handleConfigPost();
 void handleNotFound();
 bool enqueueOutgoing(const String &sender, const String &text, uint16_t *idOut);
 void processTxQueue();
@@ -306,6 +328,7 @@ void receiveRadioPacket();
 MeshNodeInfo *findMeshNode(uint8_t address);
 String nodeName(uint8_t address);
 void recordNodeHeard(uint8_t address, uint8_t via, uint8_t hopLimit, int rssi, float snr);
+void updateRemoteNodeInfo(uint8_t address, const String &payload);
 void recordRadioTx(uint8_t type, uint8_t from, uint8_t relay);
 void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen);
 void handleIncomingHello(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen);
@@ -338,6 +361,7 @@ void setup() {
   nextMessageId = (uint16_t)esp_random();
   if (nextMessageId == 0) nextMessageId = 1;
   initCryptoKeys();
+  loadNodeConfig();
 
   Serial.println();
   Serial.print("Starting radio backend: ");
@@ -359,6 +383,8 @@ void setup() {
   server.on("/api/messages", HTTP_GET, handleMessages);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/nodes", HTTP_GET, handleNodes);
+  server.on("/api/config", HTTP_GET, handleConfigGet);
+  server.on("/api/config", HTTP_POST, handleConfigPost);
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -438,6 +464,16 @@ bool radioSignalAvailable() {
 #endif
 }
 
+String defaultLocalNodeName() {
+#if NODE_PRESET == 1
+  return "Node A";
+#elif NODE_PRESET == 2
+  return "Node B";
+#else
+  return "Node C";
+#endif
+}
+
 String jsonEscape(const String &value) {
   String out;
   out.reserve(value.length() + 8);
@@ -466,6 +502,33 @@ String cleanField(String value, size_t maxLen) {
   while (value.indexOf("  ") >= 0) value.replace("  ", " ");
   if (value.length() > maxLen) value = value.substring(0, maxLen);
   return value;
+}
+
+void loadNodeConfig() {
+  MeshNodeInfo *localNode = findMeshNode(NODE_ADDRESS);
+  if (localNode == nullptr) return;
+
+  prefs.begin("lorachat", true);
+  String savedName = prefs.getString("nodeName", defaultLocalNodeName());
+  prefs.end();
+
+  savedName = cleanField(savedName, MAX_NODE_NAME_LEN);
+  if (savedName.length() == 0) savedName = defaultLocalNodeName();
+  localNode->setName(savedName.c_str());
+}
+
+bool saveLocalNodeName(const String &name) {
+  String cleanName = cleanField(name, MAX_NODE_NAME_LEN);
+  if (cleanName.length() == 0) return false;
+
+  MeshNodeInfo *localNode = findMeshNode(NODE_ADDRESS);
+  if (localNode == nullptr) return false;
+
+  prefs.begin("lorachat", false);
+  bool ok = prefs.putString("nodeName", cleanName) > 0;
+  prefs.end();
+  if (ok) localNode->setName(cleanName.c_str());
+  return ok;
 }
 
 void sendNoStoreJson(int code, const String &payload) {
@@ -583,6 +646,8 @@ void handleStatus() {
   }
   String response = "{\"node\":\"";
   response += hexByte(NODE_ADDRESS);
+  response += "\",\"name\":\"";
+  response += jsonEscape(nodeName(NODE_ADDRESS));
   response += "\",\"destination\":\"";
   response += destinationLabel();
   response += "\",\"mode\":\"";
@@ -675,6 +740,33 @@ void handleNodes() {
   }
 
   response += "]}";
+  sendNoStoreJson(200, response);
+}
+
+void handleConfigGet() {
+  String response = "{\"node\":\"";
+  response += hexByte(NODE_ADDRESS);
+  response += "\",\"name\":\"";
+  response += jsonEscape(nodeName(NODE_ADDRESS));
+  response += "\",\"ap\":\"";
+  response += jsonEscape(AP_SSID);
+  response += "\",\"ip\":\"";
+  response += WiFi.softAPIP().toString();
+  response += "\"}";
+  sendNoStoreJson(200, response);
+}
+
+void handleConfigPost() {
+  String name = server.arg("name");
+  if (!saveLocalNodeName(name)) {
+    sendNoStoreJson(400, "{\"error\":\"invalid node name\"}");
+    return;
+  }
+
+  nextHelloAt = millis() + 500;
+  String response = "{\"status\":\"saved\",\"name\":\"";
+  response += jsonEscape(nodeName(NODE_ADDRESS));
+  response += "\"}";
   sendNoStoreJson(200, response);
 }
 
@@ -1095,6 +1187,20 @@ void recordNodeHeard(uint8_t address, uint8_t via, uint8_t hopLimit, int rssi, f
   node->lastHeardAt = millis();
 }
 
+void updateRemoteNodeInfo(uint8_t address, const String &payload) {
+  MeshNodeInfo *node = findMeshNode(address);
+  if (node == nullptr || node->local) return;
+
+  int splitAt = payload.indexOf('\n');
+  String name = splitAt >= 0 ? payload.substring(0, splitAt) : payload;
+  String role = splitAt >= 0 ? payload.substring(splitAt + 1) : "";
+  name = cleanField(name, MAX_NODE_NAME_LEN);
+  role = cleanField(role, MAX_ROLE_LEN);
+
+  if (name.length() > 0) node->setName(name.c_str());
+  if (role.length() > 0) node->setRole(role.c_str());
+}
+
 void recordRadioTx(uint8_t type, uint8_t from, uint8_t relay) {
   MeshNodeInfo *localNode = findMeshNode(NODE_ADDRESS);
   if (localNode == nullptr) return;
@@ -1136,6 +1242,7 @@ void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimi
   }
 
   rememberSeen(from, id, relay, hopLimit);
+  updateRemoteNodeInfo(from, payload);
   recordNodeHeard(from, relay, hopLimit, lastPacketRssi, lastPacketSnr);
 
   if (addressedToUs) {

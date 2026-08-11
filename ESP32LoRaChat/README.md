@@ -252,6 +252,10 @@ URL: http://192.168.4.1
 
 Each ESP32 access point normally uses the same local gateway IP, `192.168.4.1`, for the phone connected to that one node. The other LoRa nodes are not reachable as browser IP addresses through LoRa. Instead, the UI `Nodes` tab shows mesh node addresses such as `0xAA`, `0xBB`, and `0xCC`, plus last-heard activity from encrypted heartbeat packets.
 
+Users do not need Bluetooth for this app. The phone/laptop connects to the nearby ESP32 over WiFi, opens the local web UI, and the ESP32 carries messages to other nodes over LoRa.
+
+The `Node Name` field in the sidebar changes the friendly name broadcast by this ESP32. The name is saved on the device and included in encrypted heartbeat packets, so other nodes can show that name in their `Nodes` tab.
+
 ## Expected Behavior
 
 Default mode is mesh broadcast:
