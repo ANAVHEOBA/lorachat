@@ -1,0 +1,23 @@
+# Arduino/ESP32 generated output
+.build/
+
+# Project-local Arduino CLI caches and installed board/library packages
+.arduino15/
+.arduino-user/
+.tools/
+
+# Compiled firmware artifacts if a build is written outside .build/
+*.bin
+*.elf
+*.hex
+*.map
+*.partitions.bin
+
+# Host simulator artifacts
+*.o
+*.out
+
+# macOS/editor noise
+.DS_Store
+*.swp
+*.swo
