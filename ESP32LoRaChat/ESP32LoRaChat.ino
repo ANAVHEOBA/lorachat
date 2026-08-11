@@ -169,21 +169,25 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <title>LoRa Chat</title>
   <style>
     :root {
-      --bg: #101419;
-      --panel: #18202a;
-      --line: #2b3745;
-      --text: #eef3f8;
-      --muted: #97a6b6;
-      --accent: #3dbb8f;
-      --outgoing: #245c4d;
-      --incoming: #263445;
-      --danger: #d66b6b;
-      --warn: #d6b15f;
+      --bg: #0f1216;
+      --panel: #171c22;
+      --panel-2: #20262e;
+      --panel-3: #121820;
+      --line: #303943;
+      --text: #edf2f7;
+      --muted: #94a3b3;
+      --accent: #42c99a;
+      --accent-2: #6da8df;
+      --outgoing: #1f5a49;
+      --incoming: #27313d;
+      --danger: #dc7373;
+      --warn: #d8b45f;
+      --good: #68d391;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      min-height: 100vh;
+      min-height: 100dvh;
       background: var(--bg);
       color: var(--text);
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -191,51 +195,123 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       justify-content: center;
     }
     .app {
-      width: min(720px, 100vw);
-      min-height: 100vh;
+      width: min(980px, 100vw);
+      min-height: 100dvh;
       display: grid;
-      grid-template-rows: auto 1fr auto;
+      grid-template-rows: auto auto auto 1fr auto;
       background: var(--panel);
       border-left: 1px solid var(--line);
       border-right: 1px solid var(--line);
     }
     header {
-      padding: 14px 16px;
+      padding: 14px 16px 12px;
       border-bottom: 1px solid var(--line);
       display: flex;
       gap: 12px;
       align-items: center;
       justify-content: space-between;
     }
-    .title {
+    .brand {
       min-width: 0;
     }
-    h1 {
-      font-size: 18px;
+    .kicker {
+      display: block;
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0;
       line-height: 1.2;
-      margin: 0 0 4px;
-      font-weight: 650;
+      text-transform: uppercase;
+    }
+    h1 {
+      font-size: 21px;
+      line-height: 1.2;
+      margin: 2px 0 3px;
+      font-weight: 750;
     }
     #status {
       color: var(--muted);
       font-size: 13px;
       overflow-wrap: anywhere;
     }
-    .namebox {
+    .identity {
       display: flex;
       gap: 8px;
       align-items: center;
     }
-    .namebox input {
+    label,
+    .metric span,
+    .detail span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+    .identity input {
       width: 140px;
       max-width: 34vw;
     }
+    .summary,
+    .details {
+      display: grid;
+      gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .summary {
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      background: #131920;
+    }
+    .details {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      background: var(--panel);
+    }
+    .metric,
+    .detail {
+      min-width: 0;
+      min-height: 58px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+    }
+    .metric strong,
+    .detail strong {
+      display: block;
+      margin-top: 5px;
+      overflow: hidden;
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 750;
+      line-height: 1.25;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .metric.primary strong {
+      color: var(--accent);
+    }
+    .metric.security strong,
+    .signal.good {
+      color: var(--good);
+    }
+    .signal.warn {
+      color: var(--warn);
+    }
+    .signal.bad {
+      color: var(--danger);
+    }
     main {
       overflow-y: auto;
-      padding: 16px;
+      padding: 14px 16px 18px;
+      background: var(--panel-3);
       display: flex;
       flex-direction: column;
       gap: 10px;
+    }
+    .empty {
+      margin: auto;
+      color: var(--muted);
+      font-size: 14px;
     }
     .msg {
       max-width: min(82%, 520px);
@@ -267,6 +343,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       font-size: 12px;
       margin-top: 6px;
     }
+    .state.acked,
+    .state.sent {
+      color: var(--good);
+    }
     .state.failed { color: var(--danger); }
     .state.retrying,
     .state.queued,
@@ -277,6 +357,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       display: grid;
       grid-template-columns: 1fr auto;
       gap: 10px;
+      background: var(--panel);
     }
     input,
     button {
@@ -303,14 +384,33 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       opacity: 0.45;
       cursor: not-allowed;
     }
+    .offline {
+      color: var(--danger) !important;
+    }
+    @media (max-width: 760px) {
+      .summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .details {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
     @media (max-width: 520px) {
       header {
         align-items: stretch;
         flex-direction: column;
       }
-      .namebox input {
+      .identity {
+        align-items: stretch;
+        flex-direction: column;
+      }
+      .identity input {
         width: 100%;
         max-width: none;
+      }
+      .summary,
+      .details {
+        grid-template-columns: 1fr;
       }
       .msg {
         max-width: 92%;
@@ -321,14 +421,29 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <body>
   <div class="app">
     <header>
-      <div class="title">
+      <div class="brand">
+        <span class="kicker">Encrypted mesh</span>
         <h1>LoRa Chat</h1>
         <div id="status">Starting</div>
       </div>
-      <div class="namebox">
+      <div class="identity">
+        <label for="name">Name</label>
         <input id="name" maxlength="18" autocomplete="nickname" placeholder="Name">
       </div>
     </header>
+    <section class="summary" aria-label="Mesh status">
+      <div class="metric primary"><span>Node</span><strong id="nodeValue">--</strong></div>
+      <div class="metric"><span>Destination</span><strong id="destValue">--</strong></div>
+      <div class="metric"><span>Mode</span><strong id="modeValue">--</strong></div>
+      <div class="metric security"><span>Security</span><strong id="cryptoValue">--</strong></div>
+      <div class="metric"><span>Queue</span><strong id="queueValue">--</strong></div>
+    </section>
+    <section class="details" aria-label="Radio status">
+      <div class="detail"><span>Radio</span><strong id="radioValue">Starting</strong></div>
+      <div class="detail"><span>Signal</span><strong id="signalValue" class="signal">--</strong></div>
+      <div class="detail"><span>RF</span><strong id="rfValue">--</strong></div>
+      <div class="detail"><span>WiFi Clients</span><strong id="clientsValue">0</strong></div>
+    </section>
     <main id="messages"></main>
     <footer>
       <input id="message" maxlength="120" autocomplete="off" placeholder="Message">
@@ -341,15 +456,39 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const nameEl = document.getElementById('name');
     const messageEl = document.getElementById('message');
     const sendEl = document.getElementById('send');
+    const fields = {
+      node: document.getElementById('nodeValue'),
+      dest: document.getElementById('destValue'),
+      mode: document.getElementById('modeValue'),
+      crypto: document.getElementById('cryptoValue'),
+      queue: document.getElementById('queueValue'),
+      radio: document.getElementById('radioValue'),
+      signal: document.getElementById('signalValue'),
+      rf: document.getElementById('rfValue'),
+      clients: document.getElementById('clientsValue')
+    };
     let lastRender = '';
 
     nameEl.value = localStorage.getItem('loraChatName') || 'User';
 
     function timeLabel(ms) {
       const totalSeconds = Math.floor(ms / 1000);
+      if (totalSeconds < 60) return `${totalSeconds}s`;
       const minutes = Math.floor(totalSeconds / 60);
-      const seconds = totalSeconds % 60;
-      return `${minutes}m ${seconds}s`;
+      if (minutes < 60) return `${minutes}m`;
+      const hours = Math.floor(minutes / 60);
+      return `${hours}h ${minutes % 60}m`;
+    }
+
+    function bandwidthLabel(value) {
+      const hz = Number(value) || 0;
+      if (!hz) return '--';
+      if (hz >= 1000) return `${Math.round(hz / 1000)} kHz`;
+      return `${hz} Hz`;
+    }
+
+    function setText(el, value) {
+      el.textContent = value == null || value === '' ? '--' : value;
     }
 
     function renderMessages(items) {
@@ -358,6 +497,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       const wasNearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
       lastRender = signature;
       messagesEl.textContent = '';
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No messages yet';
+        messagesEl.appendChild(empty);
+        return;
+      }
       items.forEach(item => {
         const row = document.createElement('section');
         row.className = `msg ${item.outgoing ? 'out' : 'in'}`;
@@ -383,12 +529,38 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         const state = document.createElement('div');
         state.className = `state ${item.status}`;
         const hopText = `${item.hops || 0} ${(item.hops || 0) === 1 ? 'hop' : 'hops'}`;
-        state.textContent = item.outgoing ? item.status : `rssi ${item.rssi} dBm | ${hopText}`;
+        state.textContent = item.outgoing ? item.status : `${item.from} | rssi ${item.rssi} dBm | snr ${item.snr} | ${hopText}`;
         row.appendChild(state);
 
         messagesEl.appendChild(row);
       });
       if (wasNearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function renderStatus(status) {
+      const txQueue = Number(status.txQueue) || 0;
+      const relayQueue = Number(status.relayQueue) || 0;
+      const queueTotal = Number(status.queue) || 0;
+      const hasPacket = status.radio && status.radio !== 'no packets';
+      const rssi = Number(status.rssi) || 0;
+      const snr = Number(status.snr) || 0;
+
+      setText(fields.node, status.node);
+      setText(fields.dest, status.destination);
+      setText(fields.mode, status.mode);
+      setText(fields.crypto, status.crypto);
+      setText(fields.queue, `${queueTotal} total | tx ${txQueue} | relay ${relayQueue}`);
+      setText(fields.radio, status.radio);
+      setText(fields.signal, hasPacket ? `${rssi} dBm | ${snr.toFixed(1)} dB` : '--');
+      setText(fields.rf, `SF${status.spreadingFactor} | ${bandwidthLabel(status.bandwidth)} | ${status.txPower} dBm | hop ${status.hopLimit}`);
+      setText(fields.clients, status.clients);
+
+      fields.signal.className = 'signal';
+      if (hasPacket) {
+        fields.signal.classList.add(rssi < -115 ? 'bad' : rssi < -105 ? 'warn' : 'good');
+      }
+      statusEl.classList.remove('offline');
+      statusEl.textContent = `${status.node} to ${status.destination} | ${status.radio}`;
     }
 
     async function refresh() {
@@ -400,8 +572,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         const messages = await messagesRes.json();
         const status = await statusRes.json();
         renderMessages(messages.messages || []);
-        statusEl.textContent = `node ${status.node} to ${status.destination} | wifi ${status.clients} | queue ${status.queue} | hop ${status.hopLimit} | ${status.crypto} | ${status.radio}`;
+        renderStatus(status);
       } catch (err) {
+        statusEl.classList.add('offline');
         statusEl.textContent = 'ESP32 connection lost';
       }
     }
