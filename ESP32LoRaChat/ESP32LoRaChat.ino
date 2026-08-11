@@ -3,6 +3,7 @@
 #include <SPIFFS.h>
 #include <Preferences.h>
 #include <esp_system.h>
+#include <math.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
@@ -95,6 +96,8 @@ const uint8_t PROTOCOL_VERSION = 2;
 const uint8_t PACKET_TYPE_DATA = 1;
 const uint8_t PACKET_TYPE_ACK = 2;
 const uint8_t PACKET_TYPE_HELLO = 3;
+const uint8_t PACKET_TYPE_MASK = 0x7F;
+const uint8_t PACKET_FLAG_COMPRESSED = 0x80;
 const uint8_t PACKET_HEADER_SIZE = 8;
 const uint8_t CRYPTO_NONCE_SIZE = 4;
 const uint8_t CRYPTO_TAG_SIZE = 8;
@@ -120,6 +123,22 @@ const size_t MAX_MESSAGE_LEN = 120;
 const size_t MAX_PLAINTEXT_LEN = MAX_SENDER_LEN + 1 + MAX_MESSAGE_LEN;
 const size_t MAX_FRAME_LEN = CRYPTO_NONCE_SIZE + MAX_PLAINTEXT_LEN + CRYPTO_TAG_SIZE;
 const size_t MAX_RADIO_PACKET_LEN = PACKET_HEADER_SIZE + MAX_FRAME_LEN;
+const size_t COMPRESSION_MIN_PLAINTEXT_LEN = 32;
+const size_t COMPRESSION_MIN_GAIN = 2;
+const uint8_t COMPRESSION_ESCAPE = 0x7F;
+const uint8_t COMPRESSION_RUN = 0x7E;
+const uint8_t COMPRESSION_TOKEN_BASE = 0x80;
+const uint8_t COMPRESSION_MIN_RUN = 4;
+const float COMPRESSION_SHANNON_LIMIT = 5.35f;
+const float COMPRESSION_MARKOV_LIMIT = 4.65f;
+
+const char *const COMPRESSION_DICTIONARY[] = {
+  "User\n", " the ", " and ", " you ", " are ", " for ", " with ", " from ", " that ", " this ",
+  " here", " there", " where", " when", " emergency", " message", " location", " battery",
+  " signal", " relay", " node", " lora", " meet", " base", " help", " ok", " yes", " no",
+  " at ", " to ", " in ", " is "
+};
+const uint8_t COMPRESSION_DICTIONARY_SIZE = sizeof(COMPRESSION_DICTIONARY) / sizeof(COMPRESSION_DICTIONARY[0]);
 
 WebServer server(80);
 Preferences prefs;
@@ -257,6 +276,8 @@ unsigned long as32LastByteAt = 0;
 
 uint8_t cryptoAesKey[CRYPTO_AES_KEY_SIZE] = {0};
 uint8_t cryptoHmacKey[CRYPTO_HMAC_KEY_SIZE] = {0};
+uint32_t compressedTxCount = 0;
+uint32_t compressionSavedBytes = 0;
 
 const char FALLBACK_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
@@ -330,8 +351,8 @@ String nodeName(uint8_t address);
 void recordNodeHeard(uint8_t address, uint8_t via, uint8_t hopLimit, int rssi, float snr);
 void updateRemoteNodeInfo(uint8_t address, const String &payload);
 void recordRadioTx(uint8_t type, uint8_t from, uint8_t relay);
-void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen);
-void handleIncomingHello(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen);
+void handleIncomingData(uint8_t type, uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen);
+void handleIncomingHello(uint8_t type, uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen);
 void handleIncomingAck(uint8_t to, uint8_t from, uint16_t id, const uint8_t *frame, size_t frameLen);
 void processRelayQueue();
 bool scheduleRelay(uint8_t type, uint8_t to, uint8_t from, uint16_t id, uint8_t hopLimit, const uint8_t *frame, size_t frameLen);
@@ -347,9 +368,19 @@ void deriveCryptoKey(const char *label, uint8_t *out, size_t outLen);
 void fillRandomBytes(uint8_t *out, size_t len);
 void buildCryptoIv(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t nonce[CRYPTO_NONCE_SIZE], uint8_t iv[16]);
 bool cryptPayload(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t nonce[CRYPTO_NONCE_SIZE], const uint8_t *input, size_t len, uint8_t *output);
+uint8_t basePacketType(uint8_t type);
+uint8_t compressionClass(uint8_t value);
+float estimateShannonBitsPerByte(const uint8_t *data, size_t len);
+float estimateMarkovBitsPerByte(const uint8_t *data, size_t len);
+int findCompressionToken(const uint8_t *data, size_t len, size_t pos, size_t *matchLen);
+int estimateStaticDictionarySavings(const uint8_t *data, size_t len);
+bool shouldTryCompression(const uint8_t *data, size_t len);
+bool appendCompressedLiteral(uint8_t value, uint8_t *out, size_t outCapacity, size_t *outLen);
+bool tryCompressPlaintext(const uint8_t *data, size_t len, uint8_t *out, size_t outCapacity, size_t *outLen);
+bool decompressPlaintext(const uint8_t *data, size_t len, uint8_t *out, size_t outCapacity, size_t *outLen);
 bool computeFrameTag(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t nonce[CRYPTO_NONCE_SIZE], const uint8_t *ciphertext, size_t cipherLen, uint8_t tag[32]);
 bool constantTimeEqual(const uint8_t *a, const uint8_t *b, size_t len);
-bool buildEncryptedFrame(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t *plaintext, size_t plaintextLen, uint8_t *frame, size_t *frameLen);
+bool buildEncryptedFrame(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t *plaintext, size_t plaintextLen, uint8_t *frame, size_t *frameLen, uint8_t *wireTypeOut);
 bool decryptFrame(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t *frame, size_t frameLen, String *plaintextOut);
 bool verifyFrameOnly(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t *frame, size_t frameLen);
 
@@ -667,6 +698,11 @@ void handleStatus() {
   response += ",\"bandwidth\":";
   response += String(LORA_SIGNAL_BANDWIDTH);
   response += ",\"crypto\":\"AES-CTR+HMAC\"";
+  response += ",\"compression\":\"Shannon/Markov-gated text\"";
+  response += ",\"compressedTx\":";
+  response += String(compressedTxCount);
+  response += ",\"compressionSavedBytes\":";
+  response += String(compressionSavedBytes);
   response += ",";
   response += "\"queue\":";
   response += String(txCount + (pendingTx.active ? 1 : 0) + countRelayQueue());
@@ -870,14 +906,15 @@ void sendHelloPacket() {
 
   uint8_t frame[MAX_FRAME_LEN];
   size_t frameLen = 0;
-  if (!buildEncryptedFrame(PACKET_TYPE_HELLO, BROADCAST_ADDRESS, NODE_ADDRESS, id, (const uint8_t *)payload.c_str(), payload.length(), frame, &frameLen)) {
+  uint8_t wireType = PACKET_TYPE_HELLO;
+  if (!buildEncryptedFrame(PACKET_TYPE_HELLO, BROADCAST_ADDRESS, NODE_ADDRESS, id, (const uint8_t *)payload.c_str(), payload.length(), frame, &frameLen, &wireType)) {
     Serial.print("Encrypt HELLO failed ");
     Serial.println(id);
     return;
   }
 
   rememberSeen(NODE_ADDRESS, id, NODE_ADDRESS, LORA_HOP_LIMIT);
-  sendFramePacket(PACKET_TYPE_HELLO, BROADCAST_ADDRESS, NODE_ADDRESS, NODE_ADDRESS, LORA_HOP_LIMIT, id, frame, frameLen);
+  sendFramePacket(wireType, BROADCAST_ADDRESS, NODE_ADDRESS, NODE_ADDRESS, LORA_HOP_LIMIT, id, frame, frameLen);
 }
 
 void sendDataPacket(uint8_t to, uint16_t id, const String &sender, const String &text) {
@@ -895,13 +932,14 @@ void sendDataPacket(uint8_t to, uint16_t id, const String &sender, const String 
 void sendDataPayload(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const String &payload) {
   uint8_t frame[MAX_FRAME_LEN];
   size_t frameLen = 0;
-  if (!buildEncryptedFrame(PACKET_TYPE_DATA, to, from, id, (const uint8_t *)payload.c_str(), payload.length(), frame, &frameLen)) {
+  uint8_t wireType = PACKET_TYPE_DATA;
+  if (!buildEncryptedFrame(PACKET_TYPE_DATA, to, from, id, (const uint8_t *)payload.c_str(), payload.length(), frame, &frameLen, &wireType)) {
     Serial.print("Encrypt DATA failed ");
     Serial.println(id);
     return;
   }
 
-  sendFramePacket(PACKET_TYPE_DATA, to, from, relay, hopLimit, id, frame, frameLen);
+  sendFramePacket(wireType, to, from, relay, hopLimit, id, frame, frameLen);
 }
 
 void sendFramePacket(uint8_t type, uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen) {
@@ -1081,6 +1119,7 @@ void processRadioPacket(const uint8_t *packet, size_t packetLen) {
 
   uint8_t version = packet[0];
   uint8_t type = packet[1];
+  uint8_t baseType = basePacketType(type);
   uint8_t to = packet[2];
   uint8_t from = packet[3];
   uint8_t relay = packet[4];
@@ -1093,11 +1132,11 @@ void processRadioPacket(const uint8_t *packet, size_t packetLen) {
   if (hopLimit > LORA_HOP_LIMIT) return;
 
   const uint8_t *frame = packet + PACKET_HEADER_SIZE;
-  if (type == PACKET_TYPE_DATA) {
-    handleIncomingData(to, from, relay, hopLimit, id, frame, frameLen);
-  } else if (type == PACKET_TYPE_HELLO) {
-    handleIncomingHello(to, from, relay, hopLimit, id, frame, frameLen);
-  } else if (type == PACKET_TYPE_ACK && to == NODE_ADDRESS) {
+  if (baseType == PACKET_TYPE_DATA) {
+    handleIncomingData(type, to, from, relay, hopLimit, id, frame, frameLen);
+  } else if (baseType == PACKET_TYPE_HELLO) {
+    handleIncomingHello(type, to, from, relay, hopLimit, id, frame, frameLen);
+  } else if (baseType == PACKET_TYPE_ACK && to == NODE_ADDRESS) {
     handleIncomingAck(to, from, id, frame, frameLen);
   }
 }
@@ -1141,13 +1180,14 @@ void resetAs32Parser() {
 void sendAckPacket(uint8_t to, uint16_t id) {
   uint8_t frame[MAX_FRAME_LEN];
   size_t frameLen = 0;
-  if (!buildEncryptedFrame(PACKET_TYPE_ACK, to, NODE_ADDRESS, id, nullptr, 0, frame, &frameLen)) {
+  uint8_t wireType = PACKET_TYPE_ACK;
+  if (!buildEncryptedFrame(PACKET_TYPE_ACK, to, NODE_ADDRESS, id, nullptr, 0, frame, &frameLen, &wireType)) {
     Serial.print("Encrypt ACK failed ");
     Serial.println(id);
     return;
   }
 
-  sendFramePacket(PACKET_TYPE_ACK, to, NODE_ADDRESS, NODE_ADDRESS, 0, id, frame, frameLen);
+  sendFramePacket(wireType, to, NODE_ADDRESS, NODE_ADDRESS, 0, id, frame, frameLen);
 
   Serial.print("ACK ");
   Serial.println(id);
@@ -1207,25 +1247,25 @@ void recordRadioTx(uint8_t type, uint8_t from, uint8_t relay) {
 
   localNode->heard = true;
   localNode->lastHeardAt = millis();
-  if (type == PACKET_TYPE_DATA && from != NODE_ADDRESS && relay == NODE_ADDRESS) {
+  if (basePacketType(type) == PACKET_TYPE_DATA && from != NODE_ADDRESS && relay == NODE_ADDRESS) {
     localNode->relayCount++;
   } else {
     localNode->txCount++;
   }
 }
 
-void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen) {
+void handleIncomingData(uint8_t type, uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen) {
   bool addressedToUs = to == NODE_ADDRESS || to == BROADCAST_ADDRESS;
 
   if (from == NODE_ADDRESS) {
-    if (to == BROADCAST_ADDRESS && relay != NODE_ADDRESS && verifyFrameOnly(PACKET_TYPE_DATA, to, from, id, frame, frameLen)) {
+    if (to == BROADCAST_ADDRESS && relay != NODE_ADDRESS && verifyFrameOnly(type, to, from, id, frame, frameLen)) {
       markOutgoingStatus(id, "relayed");
     }
     return;
   }
 
   if (wasSeen(from, id)) {
-    if (relay != NODE_ADDRESS && verifyFrameOnly(PACKET_TYPE_DATA, to, from, id, frame, frameLen)) {
+    if (relay != NODE_ADDRESS && verifyFrameOnly(type, to, from, id, frame, frameLen)) {
       recordNodeHeard(from, relay, hopLimit, lastPacketRssi, lastPacketSnr);
       cancelRelay(from, id);
     }
@@ -1235,7 +1275,7 @@ void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimi
   }
 
   String payload;
-  if (!decryptFrame(PACKET_TYPE_DATA, to, from, id, frame, frameLen, &payload)) {
+  if (!decryptFrame(type, to, from, id, frame, frameLen, &payload)) {
     Serial.print("DATA auth failed ");
     Serial.println(id);
     return;
@@ -1259,7 +1299,7 @@ void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimi
   }
 
   if (hopLimit > 0 && to != NODE_ADDRESS) {
-    scheduleRelay(PACKET_TYPE_DATA, to, from, id, hopLimit - 1, frame, frameLen);
+    scheduleRelay(type, to, from, id, hopLimit - 1, frame, frameLen);
   }
 
   Serial.print("RX DATA ");
@@ -1272,11 +1312,11 @@ void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimi
   Serial.println(hopLimit);
 }
 
-void handleIncomingHello(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen) {
+void handleIncomingHello(uint8_t type, uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen) {
   if (from == NODE_ADDRESS) return;
 
   if (wasSeen(from, id)) {
-    if (relay != NODE_ADDRESS && verifyFrameOnly(PACKET_TYPE_HELLO, to, from, id, frame, frameLen)) {
+    if (relay != NODE_ADDRESS && verifyFrameOnly(type, to, from, id, frame, frameLen)) {
       recordNodeHeard(from, relay, hopLimit, lastPacketRssi, lastPacketSnr);
       cancelRelay(from, id);
     }
@@ -1284,7 +1324,7 @@ void handleIncomingHello(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLim
   }
 
   String payload;
-  if (!decryptFrame(PACKET_TYPE_HELLO, to, from, id, frame, frameLen, &payload)) {
+  if (!decryptFrame(type, to, from, id, frame, frameLen, &payload)) {
     Serial.print("HELLO auth failed ");
     Serial.println(id);
     return;
@@ -1294,7 +1334,7 @@ void handleIncomingHello(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLim
   recordNodeHeard(from, relay, hopLimit, lastPacketRssi, lastPacketSnr);
 
   if (hopLimit > 0) {
-    scheduleRelay(PACKET_TYPE_HELLO, to, from, id, hopLimit - 1, frame, frameLen);
+    scheduleRelay(type, to, from, id, hopLimit - 1, frame, frameLen);
   }
 
   Serial.print("RX HELLO ");
@@ -1331,7 +1371,7 @@ void processRelayQueue() {
 
     sendFramePacket(item.type, item.to, item.from, NODE_ADDRESS, item.hopLimit, item.id, item.frame, item.frameLen);
 
-    Serial.print(item.type == PACKET_TYPE_HELLO ? "RELAY HELLO " : "RELAY DATA ");
+    Serial.print(basePacketType(item.type) == PACKET_TYPE_HELLO ? "RELAY HELLO " : "RELAY DATA ");
     Serial.print(item.id);
     Serial.print(" from ");
     Serial.print(hexByte(item.from));
@@ -1498,6 +1538,220 @@ bool cryptPayload(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uin
   return rc == 0;
 }
 
+uint8_t basePacketType(uint8_t type) {
+  return type & PACKET_TYPE_MASK;
+}
+
+uint8_t compressionClass(uint8_t value) {
+  if (value == ' ' || value == '\n' || value == '\t') return 0;
+  if (value >= 'a' && value <= 'z') return 1;
+  if (value >= 'A' && value <= 'Z') return 2;
+  if (value >= '0' && value <= '9') return 3;
+  if (value == '.' || value == ',' || value == '?' || value == '!' || value == '-' || value == ':' || value == ';') return 4;
+  return 5;
+}
+
+float estimateShannonBitsPerByte(const uint8_t *data, size_t len) {
+  if (data == nullptr || len == 0) return 8.0f;
+
+  uint16_t counts[256] = {0};
+  for (size_t i = 0; i < len; i++) counts[data[i]]++;
+
+  float entropy = 0.0f;
+  const float invLen = 1.0f / (float)len;
+  for (uint16_t i = 0; i < 256; i++) {
+    if (counts[i] == 0) continue;
+    float p = (float)counts[i] * invLen;
+    entropy -= p * (logf(p) / logf(2.0f));
+  }
+  return entropy;
+}
+
+float estimateMarkovBitsPerByte(const uint8_t *data, size_t len) {
+  if (data == nullptr || len < 2) return 8.0f;
+
+  const uint8_t classCount = 6;
+  uint16_t transitions[classCount][classCount] = {{0}};
+  uint16_t rowTotals[classCount] = {0};
+
+  for (size_t i = 1; i < len; i++) {
+    uint8_t prev = compressionClass(data[i - 1]);
+    uint8_t curr = compressionClass(data[i]);
+    transitions[prev][curr]++;
+    rowTotals[prev]++;
+  }
+
+  float entropy = 0.0f;
+  const float invTransitions = 1.0f / (float)(len - 1);
+  for (uint8_t row = 0; row < classCount; row++) {
+    if (rowTotals[row] == 0) continue;
+
+    float rowEntropy = 0.0f;
+    const float invRow = 1.0f / (float)rowTotals[row];
+    for (uint8_t col = 0; col < classCount; col++) {
+      if (transitions[row][col] == 0) continue;
+      float p = (float)transitions[row][col] * invRow;
+      rowEntropy -= p * (logf(p) / logf(2.0f));
+    }
+
+    entropy += ((float)rowTotals[row] * invTransitions) * rowEntropy;
+  }
+
+  return entropy;
+}
+
+int findCompressionToken(const uint8_t *data, size_t len, size_t pos, size_t *matchLen) {
+  int bestToken = -1;
+  size_t bestLen = 0;
+
+  for (uint8_t i = 0; i < COMPRESSION_DICTIONARY_SIZE; i++) {
+    const char *entry = COMPRESSION_DICTIONARY[i];
+    size_t entryLen = strlen(entry);
+    if (entryLen <= bestLen || pos + entryLen > len) continue;
+    if (memcmp(data + pos, entry, entryLen) == 0) {
+      bestToken = i;
+      bestLen = entryLen;
+    }
+  }
+
+  if (matchLen != nullptr) *matchLen = bestLen;
+  return bestToken;
+}
+
+int estimateStaticDictionarySavings(const uint8_t *data, size_t len) {
+  if (data == nullptr || len == 0) return 0;
+
+  int savings = 0;
+  size_t pos = 0;
+  while (pos < len) {
+    size_t runLen = 1;
+    while (pos + runLen < len && data[pos + runLen] == data[pos] && runLen < 255) runLen++;
+    if (runLen >= COMPRESSION_MIN_RUN) {
+      savings += (int)runLen - 3;
+      pos += runLen;
+      continue;
+    }
+
+    size_t matchLen = 0;
+    int token = findCompressionToken(data, len, pos, &matchLen);
+    if (token >= 0 && matchLen > 1) {
+      savings += (int)matchLen - 1;
+      pos += matchLen;
+    } else {
+      pos++;
+    }
+  }
+
+  return savings;
+}
+
+bool shouldTryCompression(const uint8_t *data, size_t len) {
+  if (data == nullptr || len < COMPRESSION_MIN_PLAINTEXT_LEN) return false;
+
+  int staticSavings = estimateStaticDictionarySavings(data, len);
+  if (staticSavings >= (int)COMPRESSION_MIN_GAIN) return true;
+
+  float shannon = estimateShannonBitsPerByte(data, len);
+  float markov = estimateMarkovBitsPerByte(data, len);
+  return shannon <= COMPRESSION_SHANNON_LIMIT || markov <= COMPRESSION_MARKOV_LIMIT;
+}
+
+bool appendCompressedLiteral(uint8_t value, uint8_t *out, size_t outCapacity, size_t *outLen) {
+  if (out == nullptr || outLen == nullptr) return false;
+
+  if (value >= COMPRESSION_RUN) {
+    if (*outLen + 2 > outCapacity) return false;
+    out[(*outLen)++] = COMPRESSION_ESCAPE;
+    out[(*outLen)++] = value;
+    return true;
+  }
+
+  if (*outLen + 1 > outCapacity) return false;
+  out[(*outLen)++] = value;
+  return true;
+}
+
+bool tryCompressPlaintext(const uint8_t *data, size_t len, uint8_t *out, size_t outCapacity, size_t *outLen) {
+  if (data == nullptr || out == nullptr || outLen == nullptr) return false;
+  if (!shouldTryCompression(data, len)) return false;
+
+  size_t pos = 0;
+  size_t used = 0;
+
+  while (pos < len) {
+    size_t runLen = 1;
+    while (pos + runLen < len && data[pos + runLen] == data[pos] && runLen < 255) runLen++;
+    if (runLen >= COMPRESSION_MIN_RUN) {
+      if (used + 3 > outCapacity) return false;
+      out[used++] = COMPRESSION_RUN;
+      out[used++] = (uint8_t)runLen;
+      out[used++] = data[pos];
+      pos += runLen;
+      continue;
+    }
+
+    size_t matchLen = 0;
+    int token = findCompressionToken(data, len, pos, &matchLen);
+    if (token >= 0) {
+      if (used + 1 > outCapacity) return false;
+      out[used++] = COMPRESSION_TOKEN_BASE + (uint8_t)token;
+      pos += matchLen;
+      continue;
+    }
+
+    if (!appendCompressedLiteral(data[pos], out, outCapacity, &used)) return false;
+    pos++;
+  }
+
+  if (used + COMPRESSION_MIN_GAIN > len) return false;
+  *outLen = used;
+  return true;
+}
+
+bool decompressPlaintext(const uint8_t *data, size_t len, uint8_t *out, size_t outCapacity, size_t *outLen) {
+  if (data == nullptr || out == nullptr || outLen == nullptr) return false;
+
+  size_t inPos = 0;
+  size_t used = 0;
+
+  while (inPos < len) {
+    uint8_t value = data[inPos++];
+
+    if (value == COMPRESSION_ESCAPE) {
+      if (inPos >= len || used + 1 > outCapacity) return false;
+      out[used++] = data[inPos++];
+      continue;
+    }
+
+    if (value == COMPRESSION_RUN) {
+      if (inPos + 2 > len) return false;
+      uint8_t count = data[inPos++];
+      uint8_t repeated = data[inPos++];
+      if (count < COMPRESSION_MIN_RUN || used + count > outCapacity) return false;
+      memset(out + used, repeated, count);
+      used += count;
+      continue;
+    }
+
+    if (value >= COMPRESSION_TOKEN_BASE) {
+      uint8_t index = value - COMPRESSION_TOKEN_BASE;
+      if (index >= COMPRESSION_DICTIONARY_SIZE) return false;
+      const char *entry = COMPRESSION_DICTIONARY[index];
+      size_t entryLen = strlen(entry);
+      if (used + entryLen > outCapacity) return false;
+      memcpy(out + used, entry, entryLen);
+      used += entryLen;
+      continue;
+    }
+
+    if (used + 1 > outCapacity) return false;
+    out[used++] = value;
+  }
+
+  *outLen = used;
+  return true;
+}
+
 bool computeFrameTag(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t nonce[CRYPTO_NONCE_SIZE], const uint8_t *ciphertext, size_t cipherLen, uint8_t tag[32]) {
   if (cipherLen > MAX_PLAINTEXT_LEN) return false;
 
@@ -1530,21 +1784,36 @@ bool constantTimeEqual(const uint8_t *a, const uint8_t *b, size_t len) {
   return diff == 0;
 }
 
-bool buildEncryptedFrame(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t *plaintext, size_t plaintextLen, uint8_t *frame, size_t *frameLen) {
+bool buildEncryptedFrame(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uint8_t *plaintext, size_t plaintextLen, uint8_t *frame, size_t *frameLen, uint8_t *wireTypeOut) {
   if (plaintextLen > MAX_PLAINTEXT_LEN || frame == nullptr || frameLen == nullptr) return false;
   if (plaintextLen > 0 && plaintext == nullptr) return false;
 
   uint8_t *nonce = frame;
   uint8_t *ciphertext = frame + CRYPTO_NONCE_SIZE;
+  uint8_t wireType = basePacketType(type);
+  const uint8_t *payload = plaintext;
+  size_t payloadLen = plaintextLen;
+  uint8_t compressed[MAX_PLAINTEXT_LEN];
+  size_t compressedLen = 0;
   uint8_t tag[32];
 
-  fillRandomBytes(nonce, CRYPTO_NONCE_SIZE);
-  if (!cryptPayload(type, to, from, id, nonce, plaintext, plaintextLen, ciphertext)) return false;
-  if (!computeFrameTag(type, to, from, id, nonce, ciphertext, plaintextLen, tag)) return false;
+  if (wireType == PACKET_TYPE_DATA && tryCompressPlaintext(plaintext, plaintextLen, compressed, sizeof(compressed), &compressedLen)) {
+    payload = compressed;
+    payloadLen = compressedLen;
+    wireType |= PACKET_FLAG_COMPRESSED;
+    compressedTxCount++;
+    compressionSavedBytes += (uint32_t)(plaintextLen - compressedLen);
+  }
 
-  memcpy(ciphertext + plaintextLen, tag, CRYPTO_TAG_SIZE);
-  *frameLen = CRYPTO_NONCE_SIZE + plaintextLen + CRYPTO_TAG_SIZE;
+  fillRandomBytes(nonce, CRYPTO_NONCE_SIZE);
+  if (!cryptPayload(wireType, to, from, id, nonce, payload, payloadLen, ciphertext)) return false;
+  if (!computeFrameTag(wireType, to, from, id, nonce, ciphertext, payloadLen, tag)) return false;
+
+  memcpy(ciphertext + payloadLen, tag, CRYPTO_TAG_SIZE);
+  *frameLen = CRYPTO_NONCE_SIZE + payloadLen + CRYPTO_TAG_SIZE;
+  if (wireTypeOut != nullptr) *wireTypeOut = wireType;
   memset(tag, 0, sizeof(tag));
+  memset(compressed, 0, sizeof(compressed));
   return true;
 }
 
@@ -1570,10 +1839,23 @@ bool decryptFrame(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const uin
     return false;
   }
 
+  uint8_t decoded[MAX_PLAINTEXT_LEN];
+  size_t decodedLen = cipherLen;
+  const uint8_t *decodedPayload = plaintext;
+  if ((type & PACKET_FLAG_COMPRESSED) != 0) {
+    if (!decompressPlaintext(plaintext, cipherLen, decoded, sizeof(decoded), &decodedLen)) {
+      memset(plaintext, 0, sizeof(plaintext));
+      memset(decoded, 0, sizeof(decoded));
+      return false;
+    }
+    decodedPayload = decoded;
+  }
+
   plaintextOut->remove(0);
-  plaintextOut->reserve(cipherLen);
-  for (size_t i = 0; i < cipherLen; i++) *plaintextOut += (char)plaintext[i];
+  plaintextOut->reserve(decodedLen);
+  for (size_t i = 0; i < decodedLen; i++) *plaintextOut += (char)decodedPayload[i];
   memset(plaintext, 0, sizeof(plaintext));
+  memset(decoded, 0, sizeof(decoded));
   return true;
 }
 

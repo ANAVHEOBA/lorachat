@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
@@ -13,10 +14,228 @@ constexpr uint8_t BROADCAST_ADDRESS = 0xFF;
 constexpr uint8_t PROTOCOL_VERSION = 2;
 constexpr uint8_t PACKET_TYPE_DATA = 1;
 constexpr uint8_t PACKET_TYPE_ACK = 2;
+constexpr uint8_t PACKET_TYPE_MASK = 0x7F;
+constexpr uint8_t PACKET_FLAG_COMPRESSED = 0x80;
 constexpr uint8_t LORA_HOP_LIMIT = 2;
 constexpr size_t CRYPTO_NONCE_SIZE = 4;
 constexpr size_t CRYPTO_TAG_SIZE = 8;
+constexpr size_t COMPRESSION_MIN_PLAINTEXT_LEN = 32;
+constexpr size_t COMPRESSION_MIN_GAIN = 2;
+constexpr uint8_t COMPRESSION_ESCAPE = 0x7F;
+constexpr uint8_t COMPRESSION_RUN = 0x7E;
+constexpr uint8_t COMPRESSION_TOKEN_BASE = 0x80;
+constexpr uint8_t COMPRESSION_MIN_RUN = 4;
+constexpr double COMPRESSION_SHANNON_LIMIT = 5.35;
+constexpr double COMPRESSION_MARKOV_LIMIT = 4.65;
 const std::string DEFAULT_CRYPTO_KEY = "change-this-lora-chat-key";
+const std::vector<std::string> COMPRESSION_DICTIONARY = {
+    "User\n", " the ", " and ", " you ", " are ", " for ", " with ", " from ", " that ", " this ",
+    " here", " there", " where", " when", " emergency", " message", " location", " battery",
+    " signal", " relay", " node", " lora", " meet", " base", " help", " ok", " yes", " no",
+    " at ", " to ", " in ", " is "
+};
+
+uint8_t basePacketType(uint8_t type)
+{
+    return type & PACKET_TYPE_MASK;
+}
+
+uint8_t compressionClass(uint8_t value)
+{
+    if (value == ' ' || value == '\n' || value == '\t') return 0;
+    if (value >= 'a' && value <= 'z') return 1;
+    if (value >= 'A' && value <= 'Z') return 2;
+    if (value >= '0' && value <= '9') return 3;
+    if (value == '.' || value == ',' || value == '?' || value == '!' || value == '-' || value == ':' || value == ';') {
+        return 4;
+    }
+    return 5;
+}
+
+double estimateShannonBitsPerByte(const std::string &data)
+{
+    if (data.empty()) return 8.0;
+
+    uint16_t counts[256] = {0};
+    for (unsigned char value : data) counts[value]++;
+
+    double entropy = 0.0;
+    const double invLen = 1.0 / static_cast<double>(data.size());
+    for (uint16_t count : counts) {
+        if (count == 0) continue;
+        const double p = static_cast<double>(count) * invLen;
+        entropy -= p * (std::log(p) / std::log(2.0));
+    }
+    return entropy;
+}
+
+double estimateMarkovBitsPerByte(const std::string &data)
+{
+    if (data.size() < 2) return 8.0;
+
+    constexpr uint8_t classCount = 6;
+    uint16_t transitions[classCount][classCount] = {{0}};
+    uint16_t rowTotals[classCount] = {0};
+
+    for (size_t i = 1; i < data.size(); i++) {
+        const uint8_t prev = compressionClass(static_cast<uint8_t>(data[i - 1]));
+        const uint8_t curr = compressionClass(static_cast<uint8_t>(data[i]));
+        transitions[prev][curr]++;
+        rowTotals[prev]++;
+    }
+
+    double entropy = 0.0;
+    const double invTransitions = 1.0 / static_cast<double>(data.size() - 1);
+    for (uint8_t row = 0; row < classCount; row++) {
+        if (rowTotals[row] == 0) continue;
+
+        double rowEntropy = 0.0;
+        const double invRow = 1.0 / static_cast<double>(rowTotals[row]);
+        for (uint8_t col = 0; col < classCount; col++) {
+            if (transitions[row][col] == 0) continue;
+            const double p = static_cast<double>(transitions[row][col]) * invRow;
+            rowEntropy -= p * (std::log(p) / std::log(2.0));
+        }
+
+        entropy += static_cast<double>(rowTotals[row]) * invTransitions * rowEntropy;
+    }
+    return entropy;
+}
+
+int findCompressionToken(const std::string &data, size_t pos, size_t *matchLen)
+{
+    int bestToken = -1;
+    size_t bestLen = 0;
+
+    for (size_t i = 0; i < COMPRESSION_DICTIONARY.size(); i++) {
+        const std::string &entry = COMPRESSION_DICTIONARY[i];
+        if (entry.size() <= bestLen || pos + entry.size() > data.size()) continue;
+        if (data.compare(pos, entry.size(), entry) == 0) {
+            bestToken = static_cast<int>(i);
+            bestLen = entry.size();
+        }
+    }
+
+    if (matchLen != nullptr) *matchLen = bestLen;
+    return bestToken;
+}
+
+int estimateStaticDictionarySavings(const std::string &data)
+{
+    int savings = 0;
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t runLen = 1;
+        while (pos + runLen < data.size() && data[pos + runLen] == data[pos] && runLen < 255) runLen++;
+        if (runLen >= COMPRESSION_MIN_RUN) {
+            savings += static_cast<int>(runLen) - 3;
+            pos += runLen;
+            continue;
+        }
+
+        size_t matchLen = 0;
+        const int token = findCompressionToken(data, pos, &matchLen);
+        if (token >= 0 && matchLen > 1) {
+            savings += static_cast<int>(matchLen) - 1;
+            pos += matchLen;
+        } else {
+            pos++;
+        }
+    }
+    return savings;
+}
+
+bool shouldTryCompression(const std::string &data)
+{
+    if (data.size() < COMPRESSION_MIN_PLAINTEXT_LEN) return false;
+    if (estimateStaticDictionarySavings(data) >= static_cast<int>(COMPRESSION_MIN_GAIN)) return true;
+    return estimateShannonBitsPerByte(data) <= COMPRESSION_SHANNON_LIMIT ||
+           estimateMarkovBitsPerByte(data) <= COMPRESSION_MARKOV_LIMIT;
+}
+
+bool appendCompressedLiteral(uint8_t value, std::string *out)
+{
+    if (out == nullptr) return false;
+    if (value >= COMPRESSION_RUN) {
+        out->push_back(static_cast<char>(COMPRESSION_ESCAPE));
+        out->push_back(static_cast<char>(value));
+    } else {
+        out->push_back(static_cast<char>(value));
+    }
+    return true;
+}
+
+bool tryCompressPlaintext(const std::string &data, std::string *out)
+{
+    if (out == nullptr || !shouldTryCompression(data)) return false;
+
+    std::string encoded;
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t runLen = 1;
+        while (pos + runLen < data.size() && data[pos + runLen] == data[pos] && runLen < 255) runLen++;
+        if (runLen >= COMPRESSION_MIN_RUN) {
+            encoded.push_back(static_cast<char>(COMPRESSION_RUN));
+            encoded.push_back(static_cast<char>(runLen));
+            encoded.push_back(data[pos]);
+            pos += runLen;
+            continue;
+        }
+
+        size_t matchLen = 0;
+        const int token = findCompressionToken(data, pos, &matchLen);
+        if (token >= 0) {
+            encoded.push_back(static_cast<char>(COMPRESSION_TOKEN_BASE + token));
+            pos += matchLen;
+            continue;
+        }
+
+        appendCompressedLiteral(static_cast<uint8_t>(data[pos]), &encoded);
+        pos++;
+    }
+
+    if (encoded.size() + COMPRESSION_MIN_GAIN > data.size()) return false;
+    *out = encoded;
+    return true;
+}
+
+bool decompressPlaintext(const std::string &data, std::string *out)
+{
+    if (out == nullptr) return false;
+
+    std::string decoded;
+    size_t pos = 0;
+    while (pos < data.size()) {
+        const uint8_t value = static_cast<uint8_t>(data[pos++]);
+
+        if (value == COMPRESSION_ESCAPE) {
+            if (pos >= data.size()) return false;
+            decoded.push_back(data[pos++]);
+            continue;
+        }
+
+        if (value == COMPRESSION_RUN) {
+            if (pos + 2 > data.size()) return false;
+            const uint8_t count = static_cast<uint8_t>(data[pos++]);
+            const char repeated = data[pos++];
+            if (count < COMPRESSION_MIN_RUN) return false;
+            decoded.append(count, repeated);
+            continue;
+        }
+
+        if (value >= COMPRESSION_TOKEN_BASE) {
+            const size_t index = static_cast<size_t>(value - COMPRESSION_TOKEN_BASE);
+            if (index >= COMPRESSION_DICTIONARY.size()) return false;
+            decoded += COMPRESSION_DICTIONARY[index];
+            continue;
+        }
+
+        decoded.push_back(static_cast<char>(value));
+    }
+
+    *out = decoded;
+    return true;
+}
 
 std::string hexByte(uint8_t value)
 {
@@ -77,7 +296,7 @@ std::string cryptForSim(const std::string &input, const std::string &nonce, cons
     return output;
 }
 
-std::string buildFrame(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const std::string &plaintext,
+std::string buildFrame(uint8_t &type, uint8_t to, uint8_t from, uint16_t id, const std::string &plaintext,
                        const std::string &key)
 {
     std::string nonce;
@@ -86,7 +305,15 @@ std::string buildFrame(uint8_t type, uint8_t to, uint8_t from, uint16_t id, cons
     nonce.push_back(static_cast<char>(from));
     nonce.push_back(static_cast<char>(to));
 
-    std::string ciphertext = cryptForSim(plaintext, nonce, key);
+    std::string payload = plaintext;
+    type = basePacketType(type);
+    std::string compressed;
+    if (type == PACKET_TYPE_DATA && tryCompressPlaintext(plaintext, &compressed)) {
+        payload = compressed;
+        type |= PACKET_FLAG_COMPRESSED;
+    }
+
+    std::string ciphertext = cryptForSim(payload, nonce, key);
     std::string frame = nonce + ciphertext;
     appendTag(frame, frameTag(type, to, from, id, nonce, ciphertext, key));
     return frame;
@@ -104,7 +331,11 @@ bool openFrame(uint8_t type, uint8_t to, uint8_t from, uint16_t id, const std::s
     const uint64_t expectedTag = frameTag(type, to, from, id, nonce, ciphertext, key);
     if (storedTag != expectedTag) return false;
 
-    if (plaintextOut != nullptr) *plaintextOut = cryptForSim(ciphertext, nonce, key);
+    if (plaintextOut != nullptr) {
+        std::string plaintext = cryptForSim(ciphertext, nonce, key);
+        if ((type & PACKET_FLAG_COMPRESSED) != 0 && !decompressPlaintext(plaintext, &plaintext)) return false;
+        *plaintextOut = plaintext;
+    }
     return true;
 }
 
@@ -296,9 +527,10 @@ void Node::sendChat(uint8_t to, uint16_t id, const std::string &sender, const st
 
 void Node::receive(const Packet &packet)
 {
-    if (packet.type == PACKET_TYPE_DATA) {
+    const uint8_t type = basePacketType(packet.type);
+    if (type == PACKET_TYPE_DATA) {
         handleIncomingData(packet);
-    } else if (packet.type == PACKET_TYPE_ACK && packet.to == address) {
+    } else if (type == PACKET_TYPE_ACK && packet.to == address) {
         handleIncomingAck(packet);
     }
 }
@@ -324,7 +556,7 @@ void Node::sendDataPayload(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopL
     packet.relay = relay;
     packet.hopLimit = hopLimit;
     packet.id = id;
-    packet.payload = buildFrame(PACKET_TYPE_DATA, to, from, id, payload, cryptoKey);
+    packet.payload = buildFrame(packet.type, to, from, id, payload, cryptoKey);
     sendFramePacket(packet);
 }
 
@@ -342,7 +574,7 @@ void Node::sendAckPacket(uint8_t to, uint16_t id)
     packet.relay = address;
     packet.hopLimit = 0;
     packet.id = id;
-    packet.payload = buildFrame(PACKET_TYPE_ACK, to, address, id, "", cryptoKey);
+    packet.payload = buildFrame(packet.type, to, address, id, "", cryptoKey);
     sendFramePacket(packet);
 }
 
@@ -352,7 +584,7 @@ void Node::handleIncomingData(const Packet &packet)
 
     if (packet.from == address) {
         if (packet.to == BROADCAST_ADDRESS && packet.relay != address &&
-            openFrame(PACKET_TYPE_DATA, packet.to, packet.from, packet.id, packet.payload, cryptoKey, nullptr)) {
+            openFrame(packet.type, packet.to, packet.from, packet.id, packet.payload, cryptoKey, nullptr)) {
             markOutgoingStatus(packet.id, "relayed");
         }
         return;
@@ -360,14 +592,14 @@ void Node::handleIncomingData(const Packet &packet)
 
     if (wasSeen(packet.from, packet.id)) {
         if (packet.relay != address &&
-            openFrame(PACKET_TYPE_DATA, packet.to, packet.from, packet.id, packet.payload, cryptoKey, nullptr)) {
+            openFrame(packet.type, packet.to, packet.from, packet.id, packet.payload, cryptoKey, nullptr)) {
             cancelRelay(packet.from, packet.id);
         }
         return;
     }
 
     std::string plaintext;
-    if (!openFrame(PACKET_TYPE_DATA, packet.to, packet.from, packet.id, packet.payload, cryptoKey, &plaintext)) return;
+    if (!openFrame(packet.type, packet.to, packet.from, packet.id, packet.payload, cryptoKey, &plaintext)) return;
 
     rememberSeen(packet.from, packet.id);
 
@@ -568,6 +800,41 @@ void testWrongKeyRejected()
     std::cout << "PASS wrong key rejection: B ignored unauthenticated ciphertext\n";
 }
 
+void testCompressionRoundTrip()
+{
+    const std::string payload =
+        "User\nwhere are you where are you with the relay node at the base and the signal is ok";
+    uint8_t type = PACKET_TYPE_DATA;
+    const std::string frame = buildFrame(type, BROADCAST_ADDRESS, 0xAA, 104, payload, DEFAULT_CRYPTO_KEY);
+    assert((type & PACKET_FLAG_COMPRESSED) != 0);
+
+    std::string opened;
+    assert(openFrame(type, BROADCAST_ADDRESS, 0xAA, 104, frame, DEFAULT_CRYPTO_KEY, &opened));
+    assert(opened == payload);
+    std::cout << "PASS compression round trip: Shannon/Markov-gated payload restored\n";
+}
+
+void testCompressedRelay()
+{
+    Node a(0xAA, "A");
+    Node b(0xBB, "B");
+    Node c(0xCC, "C");
+    Network net;
+    net.addNode(a);
+    net.addNode(b);
+    net.addNode(c);
+    net.addLink(a.address, b.address);
+    net.addLink(b.address, c.address);
+
+    const std::string text = "where are you where are you with the relay node at the base and the signal is ok";
+    a.sendChat(BROADCAST_ADDRESS, 105, "User", text);
+    net.run();
+
+    assert(receivedFrom(c, a.address) == 1);
+    assert(c.history.back().text == text);
+    std::cout << "PASS compressed relay: compressed DATA crossed A-B-C\n";
+}
+
 } // namespace
 
 int main()
@@ -576,6 +843,8 @@ int main()
     testDuplicateSuppression();
     testDirectAck();
     testWrongKeyRejected();
+    testCompressionRoundTrip();
+    testCompressedRelay();
     std::cout << "All mesh protocol simulation checks passed.\n";
     return 0;
 }
