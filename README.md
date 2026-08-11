@@ -10,6 +10,7 @@ The phone connects to the nearby ESP32 WiFi access point. The ESP32 serves the c
 - Default broadcast chat destination so every node can receive the same group chat
 - LoRa packet header with protocol version, packet type, destination, origin, relay, hop limit, and message ID
 - PSK-based encrypted LoRa payloads using AES-128-CTR and HMAC-SHA256/64
+- Optional Shannon/Markov-gated text compression before encryption for compressible DATA packets
 - Duplicate packet filtering by origin/message ID
 - Delayed LoRa rebroadcast with hop-limit decrement for simple long-distance relays
 - Authenticated node heartbeat packets so the UI can show which mesh nodes are available
@@ -111,7 +112,7 @@ c++ -std=c++17 -Wall -Wextra -Werror tools/mesh_protocol_sim.cpp -o .build/sim/m
 .build/sim/mesh_protocol_sim
 ```
 
-This checks encrypted broadcast relay across a line topology, duplicate suppression in a triangle topology, direct one-hop authenticated ACK behavior, and wrong-key rejection. It does not test SPI wiring, LoRa module health, antenna matching, RF range, or ESP32 WiFi behavior.
+This checks encrypted broadcast relay across a line topology, duplicate suppression in a triangle topology, direct one-hop authenticated ACK behavior, wrong-key rejection, compressed payload round-trip, and compressed relay forwarding. It does not test SPI wiring, LoRa module health, antenna matching, RF range, or ESP32 WiFi behavior.
 
 ## Hardware Pins
 
@@ -195,7 +196,7 @@ const char *CHAT_CRYPTO_PSK = "change-this-lora-chat-key";
 
 Change that value before field use. The default value is public and only proves that the crypto path works; it does not provide privacy.
 
-The PSK is hashed into separate AES and HMAC keys at boot. Data and ACK frames are authenticated. A node with the wrong PSK will ignore the packet and will not relay it.
+The PSK is hashed into separate AES and HMAC keys at boot. DATA, HELLO, and ACK frames are authenticated. A node with the wrong PSK will ignore the packet and will not relay it. DATA payload compression happens before encryption and only when the encoded payload is actually smaller.
 
 ## Upload Flow
 
@@ -254,7 +255,7 @@ Each ESP32 access point normally uses the same local gateway IP, `192.168.4.1`, 
 
 Users do not need Bluetooth for this app. The phone/laptop connects to the nearby ESP32 over WiFi, opens the local web UI, and the ESP32 carries messages to other nodes over LoRa.
 
-The `Node Name` field in the sidebar changes the friendly name broadcast by this ESP32. The name is saved on the device and included in encrypted heartbeat packets, so other nodes can show that name in their `Nodes` tab.
+Friendly node names are backend/default device identity, such as `Node A`, `Node B`, and `Node C`. They are included in encrypted heartbeat packets so other nodes can show those names in the `Nodes` tab.
 
 ## Expected Behavior
 
@@ -285,6 +286,8 @@ In direct mode, a received packet gets an ACK. If no ACK arrives after retries, 
 WhatsApp-style voice notes and live voice calls are not practical on this AS32/LoRa design.
 
 Voice notes from a browser are usually many kilobytes even when compressed. This mesh packet format is intentionally capped for short text, and LoRa airtime is too scarce to move audio clips reliably across three nodes without long delays and a high chance of loss.
+
+The built-in Shannon/Markov-gated compression is for short text payloads only. It is not an audio codec and does not make live voice calls practical over this LoRa link.
 
 Live voice calls are a worse fit: they need continuous two-way bandwidth, low latency, jitter handling, and packet loss recovery. That should use WiFi, BLE audio, cellular, or another higher-throughput radio, not this LoRa mesh. For this project, LoRa should carry text, small commands, status, and maybe very short canned alerts.
 
@@ -326,15 +329,19 @@ The custom LoRa header is 8 bytes:
 version, type, to, from, relay, hopLimit, idHigh, idLow
 ```
 
+The high bit of `type` is a compression flag. The low 7 bits carry the base packet type: DATA, ACK, or HELLO.
+
 The header stays visible so relays can forward packets. The frame after the header is encrypted/authenticated:
 
 ```text
 nonce[4], ciphertext[N], tag[8]
 ```
 
+For DATA packets, the plaintext may first pass through a small text codec. A Shannon entropy estimate and a simple Markov class-entropy estimate decide whether compression is worth trying, then the firmware still requires the compressed byte count to beat the original before setting the compression flag.
+
 For a local broadcast, `from` and `relay` are both this node. For a rebroadcast, `from` stays as the original sender and `relay` becomes the current node. `hopLimit` is decremented on each relay. The relay forwards the original encrypted frame unchanged.
 
-This firmware is not Meshtastic-compatible. The useful concepts from the larger firmware tree are implemented in a compact custom protocol here: packet history, naive flooding, direct ACK/retry, WiFi sleep disabled, separated web frontend assets, and PSK-based payload encryption using standard ESP32 mbedTLS.
+This firmware is not Meshtastic-compatible. The useful concepts from the larger firmware tree are implemented in a compact custom protocol here: packet history, naive flooding, direct ACK/retry, WiFi sleep disabled, separated web frontend assets, adaptive text compression, and PSK-based payload encryption using standard ESP32 mbedTLS.
 
 For AS32 UART, the custom mesh packet is wrapped in a serial transport frame:
 
