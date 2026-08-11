@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LoRa Chat</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="mark">LC</div>
+        <div>
+          <span class="kicker">Encrypted mesh</span>
+          <h1>LoRa Chat</h1>
+          <div id="status">Starting</div>
+        </div>
+      </div>
+
+      <div class="identity">
+        <label for="name">Name</label>
+        <input id="name" maxlength="18" autocomplete="nickname" placeholder="Name">
+      </div>
+
+      <nav class="tabs" aria-label="Main views">
+        <button class="tab active" type="button" data-tab="chat">Chat</button>
+        <button class="tab" type="button" data-tab="nodes">Nodes</button>
+        <button class="tab" type="button" data-tab="radio">Radio</button>
+      </nav>
+
+      <section class="side-metrics" aria-label="Node summary">
+        <div><span>Node</span><strong id="nodeValue">--</strong></div>
+        <div><span>Destination</span><strong id="destValue">--</strong></div>
+        <div><span>Security</span><strong id="cryptoValue">--</strong></div>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <span class="kicker" id="backendValue">Radio backend</span>
+          <h2 id="routeTitle">Mesh broadcast</h2>
+        </div>
+        <div class="link-pill" id="linkPill">
+          <span class="status-dot"></span>
+          <strong id="radioValue">Starting</strong>
+        </div>
+      </header>
+
+      <section class="summary" aria-label="Mesh status">
+        <div class="metric primary"><span>Queue</span><strong id="queueValue">--</strong></div>
+        <div class="metric"><span>WiFi Clients</span><strong id="clientsValue">0</strong></div>
+        <div class="metric"><span>Signal</span><strong id="signalValue" class="signal">--</strong></div>
+        <div class="metric"><span>AUX</span><strong id="auxValue">--</strong></div>
+      </section>
+
+      <section class="panel active" data-panel="chat">
+        <div class="message-list" id="messages"></div>
+        <footer class="composer">
+          <input id="message" maxlength="120" autocomplete="off" placeholder="Message">
+          <button id="send" type="button">Send</button>
+        </footer>
+      </section>
+
+      <section class="panel" data-panel="nodes">
+        <div class="section-head">
+          <h3>Nodes</h3>
+          <span id="nodeCount">--</span>
+        </div>
+        <div class="node-list" id="nodes"></div>
+      </section>
+
+      <section class="panel" data-panel="radio">
+        <div class="section-head">
+          <h3>Radio</h3>
+          <span id="modeValue">--</span>
+        </div>
+        <div class="radio-grid">
+          <div class="detail wide"><span>RF</span><strong id="rfValue">--</strong></div>
+          <div class="detail"><span>Transmit Queue</span><strong id="txQueueValue">--</strong></div>
+          <div class="detail"><span>Relay Queue</span><strong id="relayQueueValue">--</strong></div>
+          <div class="detail"><span>Last Packet</span><strong id="lastPacketValue">--</strong></div>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

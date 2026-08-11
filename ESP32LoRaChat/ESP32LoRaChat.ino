@@ -1,11 +1,22 @@
 #include <WiFi.h>
 #include <WebServer.h>
-#include <SPI.h>
-#include <LoRa.h>
+#include <SPIFFS.h>
 #include <esp_system.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
+
+#define RADIO_BACKEND_AS32_UART 1
+#define RADIO_BACKEND_SPI_LORA 2
+
+#ifndef RADIO_BACKEND
+#define RADIO_BACKEND RADIO_BACKEND_AS32_UART
+#endif
+
+#if RADIO_BACKEND == RADIO_BACKEND_SPI_LORA
+#include <SPI.h>
+#include <LoRa.h>
+#endif
 
 /*
   ESP32 LoRa Mesh Chat
@@ -42,6 +53,10 @@ const char *AP_SSID = "LoRaChat-C";
 
 const char *AP_PASSWORD = "chatpass123";
 
+#if RADIO_BACKEND != RADIO_BACKEND_AS32_UART && RADIO_BACKEND != RADIO_BACKEND_SPI_LORA
+#error "Set RADIO_BACKEND to RADIO_BACKEND_AS32_UART or RADIO_BACKEND_SPI_LORA"
+#endif
+
 const long LORA_FREQUENCY_HZ = 433000000L;
 const uint8_t LORA_SYNC_WORD = 0xF3;
 const uint8_t LORA_SPREADING_FACTOR = 10;
@@ -64,9 +79,21 @@ const uint8_t LORA_MOSI = 23;
 const int8_t LORA_RESET = -1;
 const int8_t LORA_DIO0 = -1;
 
+const uint8_t AS32_RX_PIN = 16;   // ESP32 RX2 receives AS32 TXD.
+const uint8_t AS32_TX_PIN = 17;   // ESP32 TX2 drives AS32 RXD.
+const uint8_t AS32_MD0_PIN = 25;
+const uint8_t AS32_MD1_PIN = 26;
+const uint8_t AS32_AUX_PIN = 27;
+const uint32_t AS32_BAUD = 9600;
+const unsigned long AS32_IDLE_TIMEOUT_MS = 1200;
+const unsigned long AS32_FRAME_TIMEOUT_MS = 250;
+const uint8_t TRANSPORT_MAGIC_1 = 0xA7;
+const uint8_t TRANSPORT_MAGIC_2 = 0x5A;
+
 const uint8_t PROTOCOL_VERSION = 2;
 const uint8_t PACKET_TYPE_DATA = 1;
 const uint8_t PACKET_TYPE_ACK = 2;
+const uint8_t PACKET_TYPE_HELLO = 3;
 const uint8_t PACKET_HEADER_SIZE = 8;
 const uint8_t CRYPTO_NONCE_SIZE = 4;
 const uint8_t CRYPTO_TAG_SIZE = 8;
@@ -75,18 +102,24 @@ const uint8_t CRYPTO_HMAC_KEY_SIZE = 32;
 
 const uint8_t MAX_RETRIES = 3;
 const unsigned long ACK_TIMEOUT_MS = 4500;
+const unsigned long HELLO_INTERVAL_MS = 30000;
+const unsigned long HELLO_FIRST_MIN_MS = 1200;
+const unsigned long HELLO_FIRST_MAX_MS = 4500;
 const unsigned long RELAY_DELAY_MIN_MS = 250;
 const unsigned long RELAY_DELAY_MAX_MS = 950;
 const uint8_t TX_QUEUE_SIZE = 8;
 const uint8_t RELAY_QUEUE_SIZE = 4;
 const uint8_t HISTORY_SIZE = 60;
 const uint8_t SEEN_CACHE_SIZE = 16;
+const uint8_t MESH_NODE_COUNT = 3;
 const size_t MAX_SENDER_LEN = 18;
 const size_t MAX_MESSAGE_LEN = 120;
 const size_t MAX_PLAINTEXT_LEN = MAX_SENDER_LEN + 1 + MAX_MESSAGE_LEN;
 const size_t MAX_FRAME_LEN = CRYPTO_NONCE_SIZE + MAX_PLAINTEXT_LEN + CRYPTO_TAG_SIZE;
+const size_t MAX_RADIO_PACKET_LEN = PACKET_HEADER_SIZE + MAX_FRAME_LEN;
 
 WebServer server(80);
+bool staticFsReady = false;
 
 struct ChatEntry {
   uint32_t seq = 0;
@@ -129,6 +162,7 @@ struct SeenPacket {
 
 struct PendingRelay {
   bool active = false;
+  uint8_t type = PACKET_TYPE_DATA;
   uint8_t to = BROADCAST_ADDRESS;
   uint8_t from = 0;
   uint16_t id = 0;
@@ -136,6 +170,27 @@ struct PendingRelay {
   uint8_t frameLen = 0;
   uint8_t frame[MAX_FRAME_LEN] = {0};
   unsigned long sendAt = 0;
+};
+
+struct MeshNodeInfo {
+  uint8_t address = 0;
+  const char *name = "";
+  const char *role = "";
+  bool local = false;
+  bool heard = false;
+  uint32_t rxCount = 0;
+  uint32_t txCount = 0;
+  uint32_t relayCount = 0;
+  uint8_t lastVia = 0;
+  uint8_t lastHops = 0;
+  int lastRssi = 0;
+  float lastSnr = 0;
+  unsigned long lastHeardAt = 0;
+
+  MeshNodeInfo() {}
+
+  MeshNodeInfo(uint8_t addressIn, const char *nameIn, const char *roleIn, bool localIn)
+      : address(addressIn), name(nameIn), role(roleIn), local(localIn) {}
 };
 
 ChatEntry history[HISTORY_SIZE];
@@ -152,15 +207,41 @@ PendingRelay relayQueue[RELAY_QUEUE_SIZE];
 SeenPacket seenPackets[SEEN_CACHE_SIZE];
 uint8_t seenWriteIndex = 0;
 uint16_t nextMessageId = 1;
+unsigned long nextHelloAt = 0;
+
+MeshNodeInfo meshNodes[MESH_NODE_COUNT] = {
+  {0xAA, "Node A", "controller", NODE_ADDRESS == 0xAA},
+  {0xBB, "Node B", "relay", NODE_ADDRESS == 0xBB},
+  {0xCC, "Node C", "receiver", NODE_ADDRESS == 0xCC},
+};
 
 int lastPacketRssi = 0;
 float lastPacketSnr = 0;
 unsigned long lastPacketAt = 0;
 
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+enum As32RxState {
+  AS32_WAIT_MAGIC_1,
+  AS32_WAIT_MAGIC_2,
+  AS32_READ_LEN_HI,
+  AS32_READ_LEN_LO,
+  AS32_READ_PAYLOAD,
+  AS32_READ_CRC_HI,
+  AS32_READ_CRC_LO
+};
+
+As32RxState as32RxState = AS32_WAIT_MAGIC_1;
+uint8_t as32RxBuffer[MAX_RADIO_PACKET_LEN] = {0};
+uint16_t as32RxLen = 0;
+uint16_t as32RxIndex = 0;
+uint16_t as32RxCrc = 0;
+unsigned long as32LastByteAt = 0;
+#endif
+
 uint8_t cryptoAesKey[CRYPTO_AES_KEY_SIZE] = {0};
 uint8_t cryptoHmacKey[CRYPTO_HMAC_KEY_SIZE] = {0};
 
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
+const char FALLBACK_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
 <html lang="en">
 <head>
@@ -168,475 +249,69 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LoRa Chat</title>
   <style>
-    :root {
-      --bg: #0f1216;
-      --panel: #171c22;
-      --panel-2: #20262e;
-      --panel-3: #121820;
-      --line: #303943;
-      --text: #edf2f7;
-      --muted: #94a3b3;
-      --accent: #42c99a;
-      --accent-2: #6da8df;
-      --outgoing: #1f5a49;
-      --incoming: #27313d;
-      --danger: #dc7373;
-      --warn: #d8b45f;
-      --good: #68d391;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100dvh;
-      background: var(--bg);
-      color: var(--text);
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      display: flex;
-      justify-content: center;
-    }
-    .app {
-      width: min(980px, 100vw);
-      min-height: 100dvh;
-      display: grid;
-      grid-template-rows: auto auto auto 1fr auto;
-      background: var(--panel);
-      border-left: 1px solid var(--line);
-      border-right: 1px solid var(--line);
-    }
-    header {
-      padding: 14px 16px 12px;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .brand {
-      min-width: 0;
-    }
-    .kicker {
-      display: block;
-      color: var(--accent);
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 0;
-      line-height: 1.2;
-      text-transform: uppercase;
-    }
-    h1 {
-      font-size: 21px;
-      line-height: 1.2;
-      margin: 2px 0 3px;
-      font-weight: 750;
-    }
-    #status {
-      color: var(--muted);
-      font-size: 13px;
-      overflow-wrap: anywhere;
-    }
-    .identity {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
-    label,
-    .metric span,
-    .detail span {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      line-height: 1.2;
-    }
-    .identity input {
-      width: 140px;
-      max-width: 34vw;
-    }
-    .summary,
-    .details {
-      display: grid;
-      gap: 8px;
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--line);
-    }
-    .summary {
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      background: #131920;
-    }
-    .details {
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      background: var(--panel);
-    }
-    .metric,
-    .detail {
-      min-width: 0;
-      min-height: 58px;
-      padding: 9px 10px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel-2);
-    }
-    .metric strong,
-    .detail strong {
-      display: block;
-      margin-top: 5px;
-      overflow: hidden;
-      color: var(--text);
-      font-size: 15px;
-      font-weight: 750;
-      line-height: 1.25;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .metric.primary strong {
-      color: var(--accent);
-    }
-    .metric.security strong,
-    .signal.good {
-      color: var(--good);
-    }
-    .signal.warn {
-      color: var(--warn);
-    }
-    .signal.bad {
-      color: var(--danger);
-    }
-    main {
-      overflow-y: auto;
-      padding: 14px 16px 18px;
-      background: var(--panel-3);
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .empty {
-      margin: auto;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    .msg {
-      max-width: min(82%, 520px);
-      padding: 10px 12px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow-wrap: anywhere;
-    }
-    .msg.out { align-self: flex-end; background: var(--outgoing); }
-    .msg.in { align-self: flex-start; background: var(--incoming); }
-    .meta {
-      display: flex;
-      gap: 8px;
-      align-items: baseline;
-      color: var(--muted);
-      font-size: 12px;
-      margin-bottom: 5px;
-    }
-    .sender {
-      color: var(--text);
-      font-weight: 650;
-    }
-    .body {
-      white-space: pre-wrap;
-      line-height: 1.35;
-    }
-    .state {
-      color: var(--muted);
-      font-size: 12px;
-      margin-top: 6px;
-    }
-    .state.acked,
-    .state.sent {
-      color: var(--good);
-    }
-    .state.failed { color: var(--danger); }
-    .state.retrying,
-    .state.queued,
-    .state.sending { color: var(--warn); }
-    footer {
-      border-top: 1px solid var(--line);
-      padding: 12px;
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 10px;
-      background: var(--panel);
-    }
-    input,
-    button {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      color: var(--text);
-      background: #111820;
-      font: inherit;
-      min-height: 42px;
-    }
-    input {
-      padding: 0 12px;
-      min-width: 0;
-    }
-    button {
-      padding: 0 16px;
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #07110e;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    button:disabled {
-      opacity: 0.45;
-      cursor: not-allowed;
-    }
-    .offline {
-      color: var(--danger) !important;
-    }
-    @media (max-width: 760px) {
-      .summary {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-      .details {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-    }
-    @media (max-width: 520px) {
-      header {
-        align-items: stretch;
-        flex-direction: column;
-      }
-      .identity {
-        align-items: stretch;
-        flex-direction: column;
-      }
-      .identity input {
-        width: 100%;
-        max-width: none;
-      }
-      .summary,
-      .details {
-        grid-template-columns: 1fr;
-      }
-      .msg {
-        max-width: 92%;
-      }
-    }
+    body { margin: 0; min-height: 100vh; background: #0f1216; color: #edf2f7; font-family: system-ui, sans-serif; display: grid; place-items: center; }
+    main { width: min(520px, calc(100vw - 32px)); padding: 20px; border: 1px solid #303943; border-radius: 8px; background: #171c22; }
+    h1 { margin: 0 0 10px; font-size: 22px; }
+    p { margin: 8px 0; color: #94a3b3; line-height: 1.45; }
+    code { color: #68d391; }
   </style>
 </head>
 <body>
-  <div class="app">
-    <header>
-      <div class="brand">
-        <span class="kicker">Encrypted mesh</span>
-        <h1>LoRa Chat</h1>
-        <div id="status">Starting</div>
-      </div>
-      <div class="identity">
-        <label for="name">Name</label>
-        <input id="name" maxlength="18" autocomplete="nickname" placeholder="Name">
-      </div>
-    </header>
-    <section class="summary" aria-label="Mesh status">
-      <div class="metric primary"><span>Node</span><strong id="nodeValue">--</strong></div>
-      <div class="metric"><span>Destination</span><strong id="destValue">--</strong></div>
-      <div class="metric"><span>Mode</span><strong id="modeValue">--</strong></div>
-      <div class="metric security"><span>Security</span><strong id="cryptoValue">--</strong></div>
-      <div class="metric"><span>Queue</span><strong id="queueValue">--</strong></div>
-    </section>
-    <section class="details" aria-label="Radio status">
-      <div class="detail"><span>Radio</span><strong id="radioValue">Starting</strong></div>
-      <div class="detail"><span>Signal</span><strong id="signalValue" class="signal">--</strong></div>
-      <div class="detail"><span>RF</span><strong id="rfValue">--</strong></div>
-      <div class="detail"><span>WiFi Clients</span><strong id="clientsValue">0</strong></div>
-    </section>
-    <main id="messages"></main>
-    <footer>
-      <input id="message" maxlength="120" autocomplete="off" placeholder="Message">
-      <button id="send" type="button">Send</button>
-    </footer>
-  </div>
-  <script>
-    const messagesEl = document.getElementById('messages');
-    const statusEl = document.getElementById('status');
-    const nameEl = document.getElementById('name');
-    const messageEl = document.getElementById('message');
-    const sendEl = document.getElementById('send');
-    const fields = {
-      node: document.getElementById('nodeValue'),
-      dest: document.getElementById('destValue'),
-      mode: document.getElementById('modeValue'),
-      crypto: document.getElementById('cryptoValue'),
-      queue: document.getElementById('queueValue'),
-      radio: document.getElementById('radioValue'),
-      signal: document.getElementById('signalValue'),
-      rf: document.getElementById('rfValue'),
-      clients: document.getElementById('clientsValue')
-    };
-    let lastRender = '';
-
-    nameEl.value = localStorage.getItem('loraChatName') || 'User';
-
-    function timeLabel(ms) {
-      const totalSeconds = Math.floor(ms / 1000);
-      if (totalSeconds < 60) return `${totalSeconds}s`;
-      const minutes = Math.floor(totalSeconds / 60);
-      if (minutes < 60) return `${minutes}m`;
-      const hours = Math.floor(minutes / 60);
-      return `${hours}h ${minutes % 60}m`;
-    }
-
-    function bandwidthLabel(value) {
-      const hz = Number(value) || 0;
-      if (!hz) return '--';
-      if (hz >= 1000) return `${Math.round(hz / 1000)} kHz`;
-      return `${hz} Hz`;
-    }
-
-    function setText(el, value) {
-      el.textContent = value == null || value === '' ? '--' : value;
-    }
-
-    function renderMessages(items) {
-      const signature = JSON.stringify(items);
-      if (signature === lastRender) return;
-      const wasNearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
-      lastRender = signature;
-      messagesEl.textContent = '';
-      if (!items.length) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = 'No messages yet';
-        messagesEl.appendChild(empty);
-        return;
-      }
-      items.forEach(item => {
-        const row = document.createElement('section');
-        row.className = `msg ${item.outgoing ? 'out' : 'in'}`;
-
-        const meta = document.createElement('div');
-        meta.className = 'meta';
-
-        const sender = document.createElement('span');
-        sender.className = 'sender';
-        sender.textContent = item.sender || (item.outgoing ? 'Me' : 'Peer');
-        meta.appendChild(sender);
-
-        const age = document.createElement('span');
-        age.textContent = timeLabel(item.ageMs);
-        meta.appendChild(age);
-        row.appendChild(meta);
-
-        const body = document.createElement('div');
-        body.className = 'body';
-        body.textContent = item.text;
-        row.appendChild(body);
-
-        const state = document.createElement('div');
-        state.className = `state ${item.status}`;
-        const hopText = `${item.hops || 0} ${(item.hops || 0) === 1 ? 'hop' : 'hops'}`;
-        state.textContent = item.outgoing ? item.status : `${item.from} | rssi ${item.rssi} dBm | snr ${item.snr} | ${hopText}`;
-        row.appendChild(state);
-
-        messagesEl.appendChild(row);
-      });
-      if (wasNearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
-    }
-
-    function renderStatus(status) {
-      const txQueue = Number(status.txQueue) || 0;
-      const relayQueue = Number(status.relayQueue) || 0;
-      const queueTotal = Number(status.queue) || 0;
-      const hasPacket = status.radio && status.radio !== 'no packets';
-      const rssi = Number(status.rssi) || 0;
-      const snr = Number(status.snr) || 0;
-
-      setText(fields.node, status.node);
-      setText(fields.dest, status.destination);
-      setText(fields.mode, status.mode);
-      setText(fields.crypto, status.crypto);
-      setText(fields.queue, `${queueTotal} total | tx ${txQueue} | relay ${relayQueue}`);
-      setText(fields.radio, status.radio);
-      setText(fields.signal, hasPacket ? `${rssi} dBm | ${snr.toFixed(1)} dB` : '--');
-      setText(fields.rf, `SF${status.spreadingFactor} | ${bandwidthLabel(status.bandwidth)} | ${status.txPower} dBm | hop ${status.hopLimit}`);
-      setText(fields.clients, status.clients);
-
-      fields.signal.className = 'signal';
-      if (hasPacket) {
-        fields.signal.classList.add(rssi < -115 ? 'bad' : rssi < -105 ? 'warn' : 'good');
-      }
-      statusEl.classList.remove('offline');
-      statusEl.textContent = `${status.node} to ${status.destination} | ${status.radio}`;
-    }
-
-    async function refresh() {
-      try {
-        const [messagesRes, statusRes] = await Promise.all([
-          fetch('/api/messages', { cache: 'no-store' }),
-          fetch('/api/status', { cache: 'no-store' })
-        ]);
-        const messages = await messagesRes.json();
-        const status = await statusRes.json();
-        renderMessages(messages.messages || []);
-        renderStatus(status);
-      } catch (err) {
-        statusEl.classList.add('offline');
-        statusEl.textContent = 'ESP32 connection lost';
-      }
-    }
-
-    async function sendMessage() {
-      const sender = nameEl.value.trim() || 'User';
-      const text = messageEl.value.trim();
-      if (!text) return;
-      localStorage.setItem('loraChatName', sender);
-      sendEl.disabled = true;
-      try {
-        const body = new URLSearchParams({ sender, message: text });
-        const res = await fetch('/api/send', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body
-        });
-        if (!res.ok) throw new Error(await res.text());
-        messageEl.value = '';
-        await refresh();
-      } catch (err) {
-        statusEl.textContent = 'send rejected';
-      } finally {
-        sendEl.disabled = false;
-        messageEl.focus();
-      }
-    }
-
-    sendEl.addEventListener('click', sendMessage);
-    messageEl.addEventListener('keydown', event => {
-      if (event.key === 'Enter') sendMessage();
-    });
-    setInterval(refresh, 1000);
-    refresh();
-  </script>
+  <main>
+    <h1>LoRa Chat</h1>
+    <p>Backend is running, but the SPIFFS web bundle is missing.</p>
+    <p>Upload <code>ESP32LoRaChat/data</code> to the ESP32 filesystem.</p>
+  </main>
 </body>
 </html>
 )rawliteral";
 
 String hexByte(uint8_t value);
 String destinationLabel();
+String radioBackendLabel();
+String radioConfigLabel();
+bool radioSignalAvailable();
 String jsonEscape(const String &value);
 String cleanField(String value, size_t maxLen);
+String contentTypeForPath(const String &path);
 void sendNoStoreJson(int code, const String &payload);
+bool serveStaticFile(String path);
 void handleRoot();
 void handleSend();
 void handleMessages();
 void handleStatus();
+void handleNodes();
 void handleNotFound();
 bool enqueueOutgoing(const String &sender, const String &text, uint16_t *idOut);
 void processTxQueue();
 void startNextPending();
 void sendPendingPacket();
+void processHelloBeacon();
+void sendHelloPacket();
 void sendDataPacket(uint8_t to, uint16_t id, const String &sender, const String &text);
 void sendDataPayload(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const String &payload);
 void sendFramePacket(uint8_t type, uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen);
+bool initRadio();
+bool sendRadioPacket(const uint8_t *packet, size_t packetLen);
+bool readRadioPacket(uint8_t *packet, size_t *packetLen);
+void processRadioPacket(const uint8_t *packet, size_t packetLen);
+uint16_t crc16Ccitt(const uint8_t *data, size_t len);
+uint16_t crc16CcittUpdate(uint16_t crc, uint8_t data);
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+bool waitAs32Idle(unsigned long timeoutMs);
+void resetAs32Parser();
+#endif
 void sendAckPacket(uint8_t to, uint16_t id);
-void receiveLoRaPacket();
+void receiveRadioPacket();
+MeshNodeInfo *findMeshNode(uint8_t address);
+String nodeName(uint8_t address);
+void recordNodeHeard(uint8_t address, uint8_t via, uint8_t hopLimit, int rssi, float snr);
+void recordRadioTx(uint8_t type, uint8_t from, uint8_t relay);
 void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen);
+void handleIncomingHello(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen);
 void handleIncomingAck(uint8_t to, uint8_t from, uint16_t id, const uint8_t *frame, size_t frameLen);
 void processRelayQueue();
-bool scheduleRelay(uint8_t to, uint8_t from, uint16_t id, uint8_t hopLimit, const uint8_t *frame, size_t frameLen);
+bool scheduleRelay(uint8_t type, uint8_t to, uint8_t from, uint16_t id, uint8_t hopLimit, const uint8_t *frame, size_t frameLen);
 void cancelRelay(uint8_t from, uint16_t id);
 uint8_t countRelayQueue();
 bool wasSeen(uint8_t from, uint16_t id);
@@ -664,61 +339,65 @@ void setup() {
   if (nextMessageId == 0) nextMessageId = 1;
   initCryptoKeys();
 
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RESET, LORA_DIO0);
-
   Serial.println();
-  Serial.println("Starting LoRa radio");
-  if (!LoRa.begin(LORA_FREQUENCY_HZ)) {
-    Serial.println("LoRa init failed. Check wiring, module frequency, and power.");
+  Serial.print("Starting radio backend: ");
+  Serial.println(radioBackendLabel());
+  if (!initRadio()) {
+    Serial.println("Radio init failed. Check wiring, module frequency, serial settings, and power.");
     while (true) delay(1000);
   }
-
-  LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
-  LoRa.setSignalBandwidth(LORA_SIGNAL_BANDWIDTH);
-  LoRa.setCodingRate4(LORA_CODING_RATE_DENOMINATOR);
-  LoRa.setPreambleLength(LORA_PREAMBLE_LENGTH);
-  LoRa.setSyncWord(LORA_SYNC_WORD);
-  LoRa.setTxPower(LORA_TX_POWER_DBM, PA_OUTPUT_PA_BOOST_PIN);
-  LoRa.enableCrc();
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
 
+  staticFsReady = SPIFFS.begin(true);
+
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/send", HTTP_POST, handleSend);
   server.on("/api/messages", HTTP_GET, handleMessages);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/nodes", HTTP_GET, handleNodes);
   server.onNotFound(handleNotFound);
   server.begin();
+
+  MeshNodeInfo *localNode = findMeshNode(NODE_ADDRESS);
+  if (localNode != nullptr) {
+    localNode->heard = true;
+    localNode->lastHeardAt = millis();
+  }
 
   Serial.print("AP: ");
   Serial.println(AP_SSID);
   Serial.print("Open: http://");
   Serial.println(WiFi.softAPIP());
+  if (staticFsReady) {
+    Serial.print("SPIFFS: ");
+    Serial.print(SPIFFS.usedBytes());
+    Serial.print("/");
+    Serial.print(SPIFFS.totalBytes());
+    Serial.println(" bytes used");
+  } else {
+    Serial.println("SPIFFS mount failed. Web UI fallback will be served.");
+  }
   Serial.print("Node: ");
   Serial.print(hexByte(NODE_ADDRESS));
   Serial.print(" -> Destination: ");
   Serial.println(destinationLabel());
-  Serial.print("LoRa: SF");
-  Serial.print(LORA_SPREADING_FACTOR);
-  Serial.print(" BW ");
-  Serial.print(LORA_SIGNAL_BANDWIDTH);
-  Serial.print(" Hz CR 4/");
-  Serial.print(LORA_CODING_RATE_DENOMINATOR);
-  Serial.print(" hop ");
-  Serial.println(LORA_HOP_LIMIT);
+  Serial.print("Radio: ");
+  Serial.println(radioConfigLabel());
   Serial.println("Crypto: AES-128-CTR + HMAC-SHA256/64");
   if (strcmp(CHAT_CRYPTO_PSK, "change-this-lora-chat-key") == 0) {
     Serial.println("WARNING: default chat PSK is still configured.");
   }
+  nextHelloAt = millis() + (unsigned long)random(HELLO_FIRST_MIN_MS, HELLO_FIRST_MAX_MS + 1);
 }
 
 void loop() {
   server.handleClient();
-  receiveLoRaPacket();
+  receiveRadioPacket();
+  processHelloBeacon();
   processRelayQueue();
   processTxQueue();
 }
@@ -732,6 +411,31 @@ String hexByte(uint8_t value) {
 String destinationLabel() {
   if (CHAT_DESTINATION == BROADCAST_ADDRESS) return "broadcast";
   return hexByte(CHAT_DESTINATION);
+}
+
+String radioBackendLabel() {
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+  return "AS32 UART";
+#else
+  return "SPI LoRa";
+#endif
+}
+
+String radioConfigLabel() {
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+  return String("AS32 UART ") + String(AS32_BAUD) + " baud | 433 MHz module | hop " + String(LORA_HOP_LIMIT);
+#else
+  return String("SF") + String(LORA_SPREADING_FACTOR) + " | " + String(LORA_SIGNAL_BANDWIDTH / 1000) + " kHz | "
+         + String(LORA_TX_POWER_DBM) + " dBm | hop " + String(LORA_HOP_LIMIT);
+#endif
+}
+
+bool radioSignalAvailable() {
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+  return false;
+#else
+  return true;
+#endif
 }
 
 String jsonEscape(const String &value) {
@@ -769,8 +473,48 @@ void sendNoStoreJson(int code, const String &payload) {
   server.send(code, "application/json", payload);
 }
 
+String contentTypeForPath(const String &path) {
+  if (path.endsWith(".html")) return "text/html";
+  if (path.endsWith(".css")) return "text/css";
+  if (path.endsWith(".js")) return "text/javascript";
+  if (path.endsWith(".json")) return "application/json";
+  if (path.endsWith(".png")) return "image/png";
+  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+  if (path.endsWith(".svg")) return "image/svg+xml";
+  if (path.endsWith(".ico")) return "image/x-icon";
+  if (path.endsWith(".gz")) return "application/gzip";
+  return "application/octet-stream";
+}
+
+bool serveStaticFile(String path) {
+  if (!staticFsReady) return false;
+  if (path.indexOf("..") >= 0) return false;
+
+  String contentType = contentTypeForPath(path);
+  String gzPath = path + ".gz";
+  bool gzip = false;
+
+  if (SPIFFS.exists(gzPath)) {
+    path = gzPath;
+    gzip = true;
+  } else if (!SPIFFS.exists(path)) {
+    return false;
+  }
+
+  File file = SPIFFS.open(path, FILE_READ);
+  if (!file) return false;
+
+  if (gzip) server.sendHeader("Content-Encoding", "gzip");
+  server.sendHeader("Cache-Control", "no-store");
+
+  server.streamFile(file, contentType);
+  file.close();
+  return true;
+}
+
 void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
+  if (serveStaticFile("/static/index.html")) return;
+  server.send_P(200, "text/html", FALLBACK_HTML);
 }
 
 void handleSend() {
@@ -817,6 +561,8 @@ void handleMessages() {
     response += String(item.rssi);
     response += ",\"snr\":";
     response += String(item.snr, 1);
+    response += ",\"signalAvailable\":";
+    response += radioSignalAvailable() ? "true" : "false";
     response += ",\"hops\":";
     response += String(item.hops);
     response += ",\"ageMs\":";
@@ -841,6 +587,10 @@ void handleStatus() {
   response += destinationLabel();
   response += "\",\"mode\":\"";
   response += CHAT_DESTINATION == BROADCAST_ADDRESS ? "mesh-broadcast" : "direct";
+  response += "\",\"backend\":\"";
+  response += radioBackendLabel();
+  response += "\",\"rf\":\"";
+  response += jsonEscape(radioConfigLabel());
   response += "\",\"clients\":";
   response += String(WiFi.softAPgetStationNum());
   response += ",\"hopLimit\":";
@@ -863,7 +613,15 @@ void handleStatus() {
   response += pendingTx.active ? "true" : "false";
   response += ",\"radio\":\"";
   response += jsonEscape(radio);
-  response += "\",\"rssi\":";
+  response += "\",\"signalAvailable\":";
+  response += radioSignalAvailable() ? "true" : "false";
+  response += ",\"auxReady\":";
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+  response += digitalRead(AS32_AUX_PIN) == HIGH ? "true" : "false";
+#else
+  response += "true";
+#endif
+  response += ",\"rssi\":";
   response += String(lastPacketRssi);
   response += ",\"snr\":";
   response += String(lastPacketSnr, 1);
@@ -871,7 +629,70 @@ void handleStatus() {
   sendNoStoreJson(200, response);
 }
 
+void handleNodes() {
+  String response = "{\"nodes\":[";
+  response.reserve(1400);
+
+  for (uint8_t i = 0; i < MESH_NODE_COUNT; i++) {
+    if (i > 0) response += ',';
+    const MeshNodeInfo &node = meshNodes[i];
+
+    response += "{\"address\":\"";
+    response += hexByte(node.address);
+    response += "\",\"name\":\"";
+    response += jsonEscape(node.name);
+    response += "\",\"role\":\"";
+    response += jsonEscape(node.role);
+    response += "\",\"local\":";
+    response += node.local ? "true" : "false";
+    response += ",\"heard\":";
+    response += node.heard ? "true" : "false";
+    response += ",\"rx\":";
+    response += String(node.rxCount);
+    response += ",\"tx\":";
+    response += String(node.txCount);
+    response += ",\"relay\":";
+    response += String(node.relayCount);
+    response += ",\"lastVia\":\"";
+    response += node.lastVia == 0 ? "--" : hexByte(node.lastVia);
+    response += "\",\"lastHops\":";
+    response += String(node.lastHops);
+    response += ",\"signalAvailable\":";
+    response += radioSignalAvailable() ? "true" : "false";
+    response += ",\"rssi\":";
+    response += String(node.lastRssi);
+    response += ",\"snr\":";
+    response += String(node.lastSnr, 1);
+    response += ",\"ageMs\":";
+    if (node.local) {
+      response += String(millis());
+    } else if (node.heard) {
+      response += String(millis() - node.lastHeardAt);
+    } else {
+      response += "null";
+    }
+    response += '}';
+  }
+
+  response += "]}";
+  sendNoStoreJson(200, response);
+}
+
 void handleNotFound() {
+  if (server.method() == HTTP_GET && !server.uri().startsWith("/api/")) {
+    String path = server.uri();
+    int queryIndex = path.indexOf('?');
+    if (queryIndex >= 0) path = path.substring(0, queryIndex);
+    if (path == "/") path = "/index.html";
+
+    String staticPath = path.startsWith("/static/") ? path : "/static" + path;
+    if (serveStaticFile(staticPath)) return;
+    if (serveStaticFile("/static/index.html")) return;
+
+    server.send_P(404, "text/html", FALLBACK_HTML);
+    return;
+  }
+
   sendNoStoreJson(404, "{\"error\":\"not found\"}");
 }
 
@@ -942,6 +763,31 @@ void sendPendingPacket() {
   pendingTx.nextRetryAt = millis() + ACK_TIMEOUT_MS;
 }
 
+void processHelloBeacon() {
+  if ((long)(millis() - nextHelloAt) < 0) return;
+  sendHelloPacket();
+  nextHelloAt = millis() + HELLO_INTERVAL_MS + (unsigned long)random(0, 2000);
+}
+
+void sendHelloPacket() {
+  uint16_t id = allocateMessageId();
+  MeshNodeInfo *localNode = findMeshNode(NODE_ADDRESS);
+  String payload = localNode == nullptr ? hexByte(NODE_ADDRESS) : String(localNode->name);
+  payload += "\n";
+  payload += localNode == nullptr ? "node" : localNode->role;
+
+  uint8_t frame[MAX_FRAME_LEN];
+  size_t frameLen = 0;
+  if (!buildEncryptedFrame(PACKET_TYPE_HELLO, BROADCAST_ADDRESS, NODE_ADDRESS, id, (const uint8_t *)payload.c_str(), payload.length(), frame, &frameLen)) {
+    Serial.print("Encrypt HELLO failed ");
+    Serial.println(id);
+    return;
+  }
+
+  rememberSeen(NODE_ADDRESS, id, NODE_ADDRESS, LORA_HOP_LIMIT);
+  sendFramePacket(PACKET_TYPE_HELLO, BROADCAST_ADDRESS, NODE_ADDRESS, NODE_ADDRESS, LORA_HOP_LIMIT, id, frame, frameLen);
+}
+
 void sendDataPacket(uint8_t to, uint16_t id, const String &sender, const String &text) {
   String payload = sender + "\n" + text;
   sendDataPayload(to, NODE_ADDRESS, NODE_ADDRESS, LORA_HOP_LIMIT, id, payload);
@@ -967,18 +813,238 @@ void sendDataPayload(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, 
 }
 
 void sendFramePacket(uint8_t type, uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen) {
-  LoRa.beginPacket();
-  LoRa.write(PROTOCOL_VERSION);
-  LoRa.write(type);
-  LoRa.write(to);
-  LoRa.write(from);
-  LoRa.write(relay);
-  LoRa.write(hopLimit);
-  LoRa.write((uint8_t)(id >> 8));
-  LoRa.write((uint8_t)(id & 0xFF));
-  LoRa.write(frame, frameLen);
-  LoRa.endPacket();
+  if (frameLen > MAX_FRAME_LEN) return;
+
+  uint8_t packet[MAX_RADIO_PACKET_LEN];
+  packet[0] = PROTOCOL_VERSION;
+  packet[1] = type;
+  packet[2] = to;
+  packet[3] = from;
+  packet[4] = relay;
+  packet[5] = hopLimit;
+  packet[6] = (uint8_t)(id >> 8);
+  packet[7] = (uint8_t)(id & 0xFF);
+  memcpy(packet + PACKET_HEADER_SIZE, frame, frameLen);
+
+  if (!sendRadioPacket(packet, PACKET_HEADER_SIZE + frameLen)) {
+    Serial.print("Radio TX failed ");
+    Serial.println(id);
+  } else {
+    recordRadioTx(type, from, relay);
+  }
 }
+
+bool initRadio() {
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+  pinMode(AS32_MD0_PIN, OUTPUT);
+  pinMode(AS32_MD1_PIN, OUTPUT);
+  digitalWrite(AS32_MD0_PIN, LOW);
+  digitalWrite(AS32_MD1_PIN, LOW);
+  pinMode(AS32_AUX_PIN, INPUT_PULLUP);
+  Serial2.begin(AS32_BAUD, SERIAL_8N1, AS32_RX_PIN, AS32_TX_PIN);
+  delay(50);
+  resetAs32Parser();
+  return waitAs32Idle(AS32_IDLE_TIMEOUT_MS);
+#else
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RESET, LORA_DIO0);
+
+  if (!LoRa.begin(LORA_FREQUENCY_HZ)) return false;
+
+  LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
+  LoRa.setSignalBandwidth(LORA_SIGNAL_BANDWIDTH);
+  LoRa.setCodingRate4(LORA_CODING_RATE_DENOMINATOR);
+  LoRa.setPreambleLength(LORA_PREAMBLE_LENGTH);
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+  LoRa.setTxPower(LORA_TX_POWER_DBM, PA_OUTPUT_PA_BOOST_PIN);
+  LoRa.enableCrc();
+  return true;
+#endif
+}
+
+bool sendRadioPacket(const uint8_t *packet, size_t packetLen) {
+  if (packetLen < PACKET_HEADER_SIZE || packetLen > MAX_RADIO_PACKET_LEN) return false;
+
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+  if (!waitAs32Idle(AS32_IDLE_TIMEOUT_MS)) return false;
+
+  uint16_t crc = 0xFFFF;
+  uint8_t lenHi = (uint8_t)(packetLen >> 8);
+  uint8_t lenLo = (uint8_t)(packetLen & 0xFF);
+  crc = crc16CcittUpdate(crc, lenHi);
+  crc = crc16CcittUpdate(crc, lenLo);
+  for (size_t i = 0; i < packetLen; i++) crc = crc16CcittUpdate(crc, packet[i]);
+
+  Serial2.write(TRANSPORT_MAGIC_1);
+  Serial2.write(TRANSPORT_MAGIC_2);
+  Serial2.write(lenHi);
+  Serial2.write(lenLo);
+  Serial2.write(packet, packetLen);
+  Serial2.write((uint8_t)(crc >> 8));
+  Serial2.write((uint8_t)(crc & 0xFF));
+  Serial2.flush();
+  return waitAs32Idle(AS32_IDLE_TIMEOUT_MS);
+#else
+  LoRa.beginPacket();
+  LoRa.write(packet, packetLen);
+  LoRa.endPacket();
+  return true;
+#endif
+}
+
+bool readRadioPacket(uint8_t *packet, size_t *packetLen) {
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+  if (as32RxState != AS32_WAIT_MAGIC_1 && (long)(millis() - as32LastByteAt) > (long)AS32_FRAME_TIMEOUT_MS) {
+    resetAs32Parser();
+  }
+
+  while (Serial2.available()) {
+    uint8_t b = (uint8_t)Serial2.read();
+    as32LastByteAt = millis();
+
+    switch (as32RxState) {
+      case AS32_WAIT_MAGIC_1:
+        if (b == TRANSPORT_MAGIC_1) as32RxState = AS32_WAIT_MAGIC_2;
+        break;
+      case AS32_WAIT_MAGIC_2:
+        if (b == TRANSPORT_MAGIC_2) {
+          as32RxState = AS32_READ_LEN_HI;
+        } else if (b != TRANSPORT_MAGIC_1) {
+          resetAs32Parser();
+        }
+        break;
+      case AS32_READ_LEN_HI:
+        as32RxLen = ((uint16_t)b) << 8;
+        as32RxState = AS32_READ_LEN_LO;
+        break;
+      case AS32_READ_LEN_LO:
+        as32RxLen |= b;
+        if (as32RxLen < PACKET_HEADER_SIZE || as32RxLen > MAX_RADIO_PACKET_LEN) {
+          resetAs32Parser();
+        } else {
+          as32RxIndex = 0;
+          as32RxState = AS32_READ_PAYLOAD;
+        }
+        break;
+      case AS32_READ_PAYLOAD:
+        as32RxBuffer[as32RxIndex++] = b;
+        if (as32RxIndex >= as32RxLen) as32RxState = AS32_READ_CRC_HI;
+        break;
+      case AS32_READ_CRC_HI:
+        as32RxCrc = ((uint16_t)b) << 8;
+        as32RxState = AS32_READ_CRC_LO;
+        break;
+      case AS32_READ_CRC_LO: {
+        as32RxCrc |= b;
+        uint16_t crc = 0xFFFF;
+        crc = crc16CcittUpdate(crc, (uint8_t)(as32RxLen >> 8));
+        crc = crc16CcittUpdate(crc, (uint8_t)(as32RxLen & 0xFF));
+        for (uint16_t i = 0; i < as32RxLen; i++) crc = crc16CcittUpdate(crc, as32RxBuffer[i]);
+
+        if (crc == as32RxCrc) {
+          memcpy(packet, as32RxBuffer, as32RxLen);
+          *packetLen = as32RxLen;
+          lastPacketRssi = 0;
+          lastPacketSnr = 0;
+          lastPacketAt = millis();
+          resetAs32Parser();
+          return true;
+        }
+
+        Serial.println("AS32 frame CRC failed");
+        resetAs32Parser();
+        break;
+      }
+    }
+  }
+
+  return false;
+#else
+  int size = LoRa.parsePacket();
+  if (!size) return false;
+
+  lastPacketRssi = LoRa.packetRssi();
+  lastPacketSnr = LoRa.packetSnr();
+  lastPacketAt = millis();
+
+  if (size < (int)PACKET_HEADER_SIZE || size > (int)MAX_RADIO_PACKET_LEN) {
+    while (LoRa.available()) LoRa.read();
+    return false;
+  }
+
+  size_t count = 0;
+  while (LoRa.available() && count < MAX_RADIO_PACKET_LEN) {
+    packet[count++] = (uint8_t)LoRa.read();
+  }
+  while (LoRa.available()) LoRa.read();
+
+  if (count != (size_t)size) return false;
+  *packetLen = count;
+  return true;
+#endif
+}
+
+void processRadioPacket(const uint8_t *packet, size_t packetLen) {
+  if (packetLen < PACKET_HEADER_SIZE) return;
+
+  uint8_t version = packet[0];
+  uint8_t type = packet[1];
+  uint8_t to = packet[2];
+  uint8_t from = packet[3];
+  uint8_t relay = packet[4];
+  uint8_t hopLimit = packet[5];
+  uint16_t id = ((uint16_t)packet[6] << 8) | packet[7];
+
+  size_t frameLen = packetLen - PACKET_HEADER_SIZE;
+  if (frameLen < (CRYPTO_NONCE_SIZE + CRYPTO_TAG_SIZE) || frameLen > MAX_FRAME_LEN) return;
+  if (version != PROTOCOL_VERSION) return;
+  if (hopLimit > LORA_HOP_LIMIT) return;
+
+  const uint8_t *frame = packet + PACKET_HEADER_SIZE;
+  if (type == PACKET_TYPE_DATA) {
+    handleIncomingData(to, from, relay, hopLimit, id, frame, frameLen);
+  } else if (type == PACKET_TYPE_HELLO) {
+    handleIncomingHello(to, from, relay, hopLimit, id, frame, frameLen);
+  } else if (type == PACKET_TYPE_ACK && to == NODE_ADDRESS) {
+    handleIncomingAck(to, from, id, frame, frameLen);
+  }
+}
+
+uint16_t crc16Ccitt(const uint8_t *data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) crc = crc16CcittUpdate(crc, data[i]);
+  return crc;
+}
+
+uint16_t crc16CcittUpdate(uint16_t crc, uint8_t data) {
+  crc ^= ((uint16_t)data) << 8;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (crc & 0x8000) {
+      crc = (crc << 1) ^ 0x1021;
+    } else {
+      crc <<= 1;
+    }
+  }
+  return crc;
+}
+
+#if RADIO_BACKEND == RADIO_BACKEND_AS32_UART
+bool waitAs32Idle(unsigned long timeoutMs) {
+  unsigned long startedAt = millis();
+  while (digitalRead(AS32_AUX_PIN) == LOW) {
+    if ((long)(millis() - startedAt) >= (long)timeoutMs) return false;
+    delay(1);
+  }
+  return true;
+}
+
+void resetAs32Parser() {
+  as32RxState = AS32_WAIT_MAGIC_1;
+  as32RxLen = 0;
+  as32RxIndex = 0;
+  as32RxCrc = 0;
+}
+#endif
 
 void sendAckPacket(uint8_t to, uint16_t id) {
   uint8_t frame[MAX_FRAME_LEN];
@@ -995,52 +1061,50 @@ void sendAckPacket(uint8_t to, uint16_t id) {
   Serial.println(id);
 }
 
-void receiveLoRaPacket() {
-  int packetSize = LoRa.parsePacket();
-  if (!packetSize) return;
-
-  lastPacketRssi = LoRa.packetRssi();
-  lastPacketSnr = LoRa.packetSnr();
-  lastPacketAt = millis();
-
-  if (packetSize < PACKET_HEADER_SIZE) {
-    while (LoRa.available()) LoRa.read();
-    return;
+void receiveRadioPacket() {
+  uint8_t packet[MAX_RADIO_PACKET_LEN];
+  size_t packetLen = 0;
+  while (readRadioPacket(packet, &packetLen)) {
+    processRadioPacket(packet, packetLen);
   }
+}
 
-  uint8_t version = LoRa.read();
-  uint8_t type = LoRa.read();
-  uint8_t to = LoRa.read();
-  uint8_t from = LoRa.read();
-  uint8_t relay = LoRa.read();
-  uint8_t hopLimit = LoRa.read();
-  uint16_t id = ((uint16_t)LoRa.read() << 8) | (uint8_t)LoRa.read();
-
-  int frameLen = packetSize - PACKET_HEADER_SIZE;
-  if (frameLen < (int)(CRYPTO_NONCE_SIZE + CRYPTO_TAG_SIZE) || frameLen > (int)MAX_FRAME_LEN) {
-    while (LoRa.available()) LoRa.read();
-    return;
+MeshNodeInfo *findMeshNode(uint8_t address) {
+  for (uint8_t i = 0; i < MESH_NODE_COUNT; i++) {
+    if (meshNodes[i].address == address) return &meshNodes[i];
   }
+  return nullptr;
+}
 
-  uint8_t frame[MAX_FRAME_LEN];
-  bool shortRead = false;
-  for (int i = 0; i < frameLen; i++) {
-    if (!LoRa.available()) {
-      shortRead = true;
-      break;
-    }
-    frame[i] = (uint8_t)LoRa.read();
-  }
-  while (LoRa.available()) LoRa.read();
-  if (shortRead) return;
+String nodeName(uint8_t address) {
+  MeshNodeInfo *node = findMeshNode(address);
+  if (node == nullptr) return hexByte(address);
+  return String(node->name);
+}
 
-  if (version != PROTOCOL_VERSION) return;
-  if (hopLimit > LORA_HOP_LIMIT) return;
+void recordNodeHeard(uint8_t address, uint8_t via, uint8_t hopLimit, int rssi, float snr) {
+  MeshNodeInfo *node = findMeshNode(address);
+  if (node == nullptr) return;
 
-  if (type == PACKET_TYPE_DATA) {
-    handleIncomingData(to, from, relay, hopLimit, id, frame, (size_t)frameLen);
-  } else if (type == PACKET_TYPE_ACK && to == NODE_ADDRESS) {
-    handleIncomingAck(to, from, id, frame, (size_t)frameLen);
+  node->heard = true;
+  node->rxCount++;
+  node->lastVia = via;
+  node->lastHops = hopLimit >= LORA_HOP_LIMIT ? 0 : LORA_HOP_LIMIT - hopLimit;
+  node->lastRssi = rssi;
+  node->lastSnr = snr;
+  node->lastHeardAt = millis();
+}
+
+void recordRadioTx(uint8_t type, uint8_t from, uint8_t relay) {
+  MeshNodeInfo *localNode = findMeshNode(NODE_ADDRESS);
+  if (localNode == nullptr) return;
+
+  localNode->heard = true;
+  localNode->lastHeardAt = millis();
+  if (type == PACKET_TYPE_DATA && from != NODE_ADDRESS && relay == NODE_ADDRESS) {
+    localNode->relayCount++;
+  } else {
+    localNode->txCount++;
   }
 }
 
@@ -1055,7 +1119,10 @@ void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimi
   }
 
   if (wasSeen(from, id)) {
-    if (relay != NODE_ADDRESS && verifyFrameOnly(PACKET_TYPE_DATA, to, from, id, frame, frameLen)) cancelRelay(from, id);
+    if (relay != NODE_ADDRESS && verifyFrameOnly(PACKET_TYPE_DATA, to, from, id, frame, frameLen)) {
+      recordNodeHeard(from, relay, hopLimit, lastPacketRssi, lastPacketSnr);
+      cancelRelay(from, id);
+    }
     Serial.print("Duplicate DATA ");
     Serial.println(id);
     return;
@@ -1069,6 +1136,7 @@ void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimi
   }
 
   rememberSeen(from, id, relay, hopLimit);
+  recordNodeHeard(from, relay, hopLimit, lastPacketRssi, lastPacketSnr);
 
   if (addressedToUs) {
     if (to == NODE_ADDRESS) sendAckPacket(from, id);
@@ -1084,7 +1152,7 @@ void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimi
   }
 
   if (hopLimit > 0 && to != NODE_ADDRESS) {
-    scheduleRelay(to, from, id, hopLimit - 1, frame, frameLen);
+    scheduleRelay(PACKET_TYPE_DATA, to, from, id, hopLimit - 1, frame, frameLen);
   }
 
   Serial.print("RX DATA ");
@@ -1097,6 +1165,39 @@ void handleIncomingData(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimi
   Serial.println(hopLimit);
 }
 
+void handleIncomingHello(uint8_t to, uint8_t from, uint8_t relay, uint8_t hopLimit, uint16_t id, const uint8_t *frame, size_t frameLen) {
+  if (from == NODE_ADDRESS) return;
+
+  if (wasSeen(from, id)) {
+    if (relay != NODE_ADDRESS && verifyFrameOnly(PACKET_TYPE_HELLO, to, from, id, frame, frameLen)) {
+      recordNodeHeard(from, relay, hopLimit, lastPacketRssi, lastPacketSnr);
+      cancelRelay(from, id);
+    }
+    return;
+  }
+
+  String payload;
+  if (!decryptFrame(PACKET_TYPE_HELLO, to, from, id, frame, frameLen, &payload)) {
+    Serial.print("HELLO auth failed ");
+    Serial.println(id);
+    return;
+  }
+
+  rememberSeen(from, id, relay, hopLimit);
+  recordNodeHeard(from, relay, hopLimit, lastPacketRssi, lastPacketSnr);
+
+  if (hopLimit > 0) {
+    scheduleRelay(PACKET_TYPE_HELLO, to, from, id, hopLimit - 1, frame, frameLen);
+  }
+
+  Serial.print("RX HELLO ");
+  Serial.print(id);
+  Serial.print(" from ");
+  Serial.print(hexByte(from));
+  Serial.print(" via ");
+  Serial.println(hexByte(relay));
+}
+
 void handleIncomingAck(uint8_t to, uint8_t from, uint16_t id, const uint8_t *frame, size_t frameLen) {
   if (!pendingTx.active || from != pendingTx.to || id != pendingTx.id) return;
   if (!verifyFrameOnly(PACKET_TYPE_ACK, to, from, id, frame, frameLen)) {
@@ -1105,6 +1206,7 @@ void handleIncomingAck(uint8_t to, uint8_t from, uint16_t id, const uint8_t *fra
     return;
   }
 
+  recordNodeHeard(from, from, LORA_HOP_LIMIT, lastPacketRssi, lastPacketSnr);
   markOutgoingStatus(id, "delivered");
   pendingTx.active = false;
 
@@ -1120,9 +1222,9 @@ void processRelayQueue() {
     if (!item.active) continue;
     if ((long)(now - item.sendAt) < 0) continue;
 
-    sendFramePacket(PACKET_TYPE_DATA, item.to, item.from, NODE_ADDRESS, item.hopLimit, item.id, item.frame, item.frameLen);
+    sendFramePacket(item.type, item.to, item.from, NODE_ADDRESS, item.hopLimit, item.id, item.frame, item.frameLen);
 
-    Serial.print("RELAY DATA ");
+    Serial.print(item.type == PACKET_TYPE_HELLO ? "RELAY HELLO " : "RELAY DATA ");
     Serial.print(item.id);
     Serial.print(" from ");
     Serial.print(hexByte(item.from));
@@ -1135,7 +1237,7 @@ void processRelayQueue() {
   }
 }
 
-bool scheduleRelay(uint8_t to, uint8_t from, uint16_t id, uint8_t hopLimit, const uint8_t *frame, size_t frameLen) {
+bool scheduleRelay(uint8_t type, uint8_t to, uint8_t from, uint16_t id, uint8_t hopLimit, const uint8_t *frame, size_t frameLen) {
   if (frameLen > MAX_FRAME_LEN) return false;
 
   for (uint8_t i = 0; i < RELAY_QUEUE_SIZE; i++) {
@@ -1147,6 +1249,7 @@ bool scheduleRelay(uint8_t to, uint8_t from, uint16_t id, uint8_t hopLimit, cons
     if (item.active) continue;
 
     item.active = true;
+    item.type = type;
     item.to = to;
     item.from = from;
     item.id = id;
